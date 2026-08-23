@@ -1,0 +1,8 @@
+{
+  "id": "rec_9b52f3",
+  "transcript": "हाँ overall experience ठीक था बस refund के लिए काफी wait करना पड़ा",
+  "model": "faster-whisper-large-v3",
+  "audio_duration": 6.42,
+  "processing_time": 26.11,
+  "real_time_factor": 4.07
+}

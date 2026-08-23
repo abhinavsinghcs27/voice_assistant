@@ -1,0 +1,93 @@
+.model-checkbox-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+}
+
+.checkbox-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  cursor: pointer;
+  background: #f8fafc;
+}
+
+.checkbox-card input {
+  margin-top: 0.2rem;
+}
+
+.checkbox-title {
+  font-weight: 600;
+  color: #0f172a;
+  display: block;
+}
+
+.checkbox-desc {
+  font-size: 0.8rem;
+  color: #64748b;
+  margin: 0.2rem 0 0 0;
+}
+
+.loading-indicator {
+  text-align: center;
+  font-weight: 500;
+  color: #2563eb;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.audio-meta {
+  margin-bottom: 1rem;
+  font-size: 0.95rem;
+  color: #334155;
+  text-align: center;
+}
+
+.results-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.result-card {
+  border-left: 4px solid #3b82f6;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.result-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+  color: #0f172a;
+}
+
+.rtf-badge {
+  padding: 0.25rem 0.6rem;
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.rtf-fast {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.rtf-slow {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.result-metric-row {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: #64748b;
+}

@@ -1,0 +1,8 @@
+{
+  "id": "rec_50f975",
+  "transcript": "کیا حال ہے بھائی کے",
+  "model": "faster-whisper-large-v3",
+  "audio_duration": 3.66,
+  "processing_time": 20.13,
+  "real_time_factor": 5.5
+}
