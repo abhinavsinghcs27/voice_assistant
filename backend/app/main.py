@@ -1,7 +1,6 @@
 import json
 import uuid
 import shutil
-from typing import List
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
