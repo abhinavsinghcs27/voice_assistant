@@ -6,14 +6,18 @@ export default function App() {
   const [selectedModels, setSelectedModels] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
+  const [audioBlob, setAudioBlob] = useState(null);
   const [audioUrl, setAudioUrl] = useState(null);
+  const [audioName, setAudioName] = useState('');
   const [loading, setLoading] = useState(false);
   const [benchmarkData, setBenchmarkData] = useState(null);
   const [error, setError] = useState(null);
+  const [copiedKey, setCopiedKey] = useState(null);
 
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const timerRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     fetch('/api/models')
@@ -28,7 +32,7 @@ export default function App() {
       })
       .catch((err) => {
         console.error(err);
-        setError("Failed to connect to backend STT service.");
+        setError("Failed to connect to backend STT service at http://127.0.0.1:8000.");
       });
   }, []);
 
@@ -57,8 +61,9 @@ export default function App() {
 
       mediaRecorderRef.current.onstop = () => {
         const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        setAudioBlob(blob);
         setAudioUrl(URL.createObjectURL(blob));
-        runBenchmark(blob);
+        setAudioName(`mic_recording_${new Date().toISOString().slice(11, 19).replace(/:/g, '-')}.webm`);
       };
 
       mediaRecorderRef.current.start();
@@ -83,12 +88,43 @@ export default function App() {
     }
   };
 
-  const runBenchmark = async (blob) => {
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setError(null);
+    setBenchmarkData(null);
+    setAudioBlob(file);
+    setAudioUrl(URL.createObjectURL(file));
+    setAudioName(file.name);
+  };
+
+  const discardAudio = () => {
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    setAudioBlob(null);
+    setAudioUrl(null);
+    setAudioName('');
+    setBenchmarkData(null);
+    setRecordingTime(0);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const runBenchmark = async () => {
+    if (!audioBlob) {
+      setError("No audio recording or file selected.");
+      return;
+    }
+
+    if (selectedModels.length === 0) {
+      setError("Please select at least one model to benchmark.");
+      return;
+    }
+
     setLoading(true);
     setError(null);
 
     const formData = new FormData();
-    formData.append('audio', blob, 'recording.webm');
+    formData.append('audio', audioBlob, audioName || 'recording.webm');
     formData.append('models', selectedModels.join(','));
 
     try {
@@ -111,6 +147,12 @@ export default function App() {
     }
   };
 
+  const copyToClipboard = (text, key) => {
+    navigator.clipboard.writeText(text);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2000);
+  };
+
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
     const secs = (seconds % 60).toString().padStart(2, '0');
@@ -118,90 +160,230 @@ export default function App() {
   };
 
   return (
-    <div className="container">
-      <h1>Hindi / Hinglish STT Multi-Model Benchmark</h1>
+    <div className="app-container">
+      <header className="header-section">
+        <span className="header-badge">AI Speech-to-Text Benchmark</span>
+        <h1 className="app-title">Hindi & Hinglish STT Benchmark</h1>
+        <p className="app-subtitle">
+          Compare ultra-fast Conformer and Whisper models on Hindi & code-mixed customer speech in 3 output modalities.
+        </p>
+      </header>
 
-      {error && <div className="error-banner">{error}</div>}
-
-      <div className="card">
-        <div className="section-title">Models to Compare</div>
-        <div className="model-checkbox-group">
-          {models.map((m) => (
-            <label key={m.id} className="checkbox-card">
-              <input
-                type="checkbox"
-                checked={selectedModels.includes(m.id)}
-                onChange={() => toggleModelSelection(m.id)}
-                disabled={isRecording || loading}
-              />
-              <div>
-                <span className="checkbox-title">{m.name}</span>
-                <p className="checkbox-desc">{m.description}</p>
-              </div>
-            </label>
-          ))}
-        </div>
-
-        <div className="mic-section">
-          <div className={`mic-btn ${isRecording ? 'recording' : ''}`}>🎙️</div>
-          <div className="timer">{formatTime(recordingTime)}</div>
-
-          <div className="btn-row">
-            {!isRecording ? (
-              <button
-                className="action-btn start"
-                onClick={startRecording}
-                disabled={loading || selectedModels.length === 0}
-              >
-                {loading ? 'Running Benchmark Across Models...' : 'Record & Compare Models'}
-              </button>
-            ) : (
-              <button className="action-btn stop" onClick={stopRecording}>
-                Stop & Run Benchmark
-              </button>
-            )}
-          </div>
-        </div>
-
-        {audioUrl && (
-          <div className="audio-preview">
-            <div className="section-title">Test Audio</div>
-            <audio controls src={audioUrl} />
-          </div>
-        )}
-      </div>
-
-      {loading && (
-        <div className="card loading-indicator">
-          ⏳ Transcribing across selected models. The first time a new model runs, it will download weights...
+      {error && (
+        <div className="error-banner">
+          <span>⚠️</span> {error}
         </div>
       )}
 
-      {benchmarkData && (
-        <div className="comparison-grid">
-          <div className="audio-meta">
-            Audio Length: <strong>{benchmarkData.audio_duration}s</strong> | Evaluated Models: <strong>{benchmarkData.results.length}</strong>
+      {/* Model Selection Card */}
+      <div className="card">
+        <div className="section-header">
+          <div className="section-title">
+            <span>⚙️</span> Select Models to Compare
+          </div>
+          <span className="section-hint">
+            {selectedModels.length} of {models.length} selected
+          </span>
+        </div>
+
+        <div className="model-grid">
+          {models.map((m) => {
+            const isSelected = selectedModels.includes(m.id);
+            return (
+              <label 
+                key={m.id} 
+                className={`model-checkbox-card ${isSelected ? 'selected' : ''}`}
+              >
+                <div className="model-card-top">
+                  <span className="model-name">{m.name}</span>
+                  <input
+                    type="checkbox"
+                    className="model-checkbox"
+                    checked={isSelected}
+                    onChange={() => toggleModelSelection(m.id)}
+                    disabled={isRecording || loading}
+                  />
+                </div>
+                <p className="model-desc">{m.description}</p>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Audio Capture & Control Card */}
+      <div className="card">
+        <div className="section-header">
+          <div className="section-title">
+            <span>🎙️</span> Audio Input
+          </div>
+          <span className="section-hint">Record from mic or upload audio file</span>
+        </div>
+
+        <div className="audio-capture-box">
+          <div className={`mic-circle ${isRecording ? 'recording' : ''}`}>
+            {isRecording ? '⏺️' : '🎙️'}
           </div>
 
-          <div className="results-cards">
-            {benchmarkData.results.map((res) => (
-              <div className="card result-card" key={res.model_id}>
-                <div className="result-header">
-                  <h3>{res.model_name}</h3>
-                  <span className={`rtf-badge ${res.real_time_factor <= 1.0 ? 'rtf-fast' : 'rtf-slow'}`}>
-                    RTF: {res.real_time_factor}x
-                  </span>
-                </div>
+          {isRecording && (
+            <div className="recording-timer">{formatTime(recordingTime)}</div>
+          )}
 
-                <div className="result-metric-row">
-                  <span>Processing Time: <strong>{res.processing_time}s</strong></span>
-                </div>
+          <div className="btn-group">
+            {!isRecording ? (
+              <>
+                <button
+                  className="btn btn-record"
+                  onClick={startRecording}
+                  disabled={loading}
+                >
+                  <span>⏺️</span> {audioUrl ? 'Record New Audio' : 'Record Audio'}
+                </button>
 
-                <div className="section-title" style={{ marginTop: '1rem' }}>Transcript</div>
-                <div className="transcript-box">{res.transcript || '(No speech recognized)'}</div>
+                <label className="btn btn-upload-label" style={{ cursor: loading ? 'not-allowed' : 'pointer' }}>
+                  <span>📁</span> Upload Audio File
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="audio/*,.wav,.mp3,.webm,.m4a,.ogg"
+                    style={{ display: 'none' }}
+                    onChange={handleFileUpload}
+                    disabled={loading}
+                  />
+                </label>
+              </>
+            ) : (
+              <button className="btn btn-stop" onClick={stopRecording}>
+                <span>⏹️</span> Stop Recording
+              </button>
+            )}
+          </div>
+
+          {/* Audio Preview & Action Bar */}
+          {audioUrl && !isRecording && (
+            <div className="audio-preview-box">
+              <div className="audio-preview-header">
+                <span>🎵 <strong>{audioName || 'Audio Ready'}</strong></span>
+                <span>Ready to Benchmark</span>
               </div>
-            ))}
+              
+              <audio controls src={audioUrl} />
+
+              <div className="btn-group" style={{ marginTop: '0.75rem' }}>
+                <button
+                  className="btn btn-primary"
+                  onClick={runBenchmark}
+                  disabled={loading || selectedModels.length === 0}
+                >
+                  <span>⚡</span> {loading ? 'Transcribing Across Models...' : 'Start Transcribing & Compare'}
+                </button>
+
+                <button
+                  className="btn btn-discard"
+                  onClick={discardAudio}
+                  disabled={loading}
+                >
+                  <span>🗑️</span> Discard Recording
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Loading Box */}
+      {loading && (
+        <div className="loading-box">
+          <div className="spinner"></div>
+          <div><strong>Transcribing across selected models...</strong></div>
+          <p style={{ fontSize: '0.85rem', color: '#93c5fd' }}>
+            Running inference on models and formatting into Devanagari, Romanised, and English.
+          </p>
+        </div>
+      )}
+
+      {/* Benchmark Results */}
+      {benchmarkData && (
+        <div className="results-grid">
+          <div className="results-meta-bar">
+            <span>⏱️ Audio Duration: <strong>{benchmarkData.audio_duration}s</strong></span>
+            <span>🤖 Evaluated Models: <strong>{benchmarkData.results.length}</strong></span>
           </div>
+
+          {benchmarkData.results.map((res) => {
+            const isFast = res.real_time_factor <= 0.2;
+            return (
+              <div 
+                className={`result-card ${isFast ? 'fast-card' : 'accurate-card'}`} 
+                key={res.model_id}
+              >
+                <div className="result-card-header">
+                  <div className="model-title-wrap">
+                    <h3>{res.model_name}</h3>
+                  </div>
+
+                  <div className="metrics-badges">
+                    <span className="badge badge-time">
+                      ⏱️ {res.processing_time}s latency
+                    </span>
+                    <span className={`badge ${res.real_time_factor <= 1.0 ? 'badge-rtf-fast' : 'badge-rtf-slow'}`}>
+                      RTF: {res.real_time_factor}x {isFast ? '⚡ Ultra-Fast' : ''}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="output-modalities">
+                  {/* Modality 1: Devanagari */}
+                  <div className="modality-block">
+                    <div className="modality-header">
+                      <span className="modality-tag devanagari-tag">🕉️ Devanagari (Hindi Script)</span>
+                      <button 
+                        className="copy-btn"
+                        onClick={() => copyToClipboard(res.devanagari || res.transcript, `${res.model_id}_dev`)}
+                      >
+                        {copiedKey === `${res.model_id}_dev` ? '✓ Copied' : 'Copy'}
+                      </button>
+                    </div>
+                    <div className="transcript-box devanagari-text">
+                      {res.devanagari || res.transcript || '(No speech recognized)'}
+                    </div>
+                  </div>
+
+                  {/* Modality 2: Romanised Hinglish */}
+                  <div className="modality-block">
+                    <div className="modality-header">
+                      <span className="modality-tag romanised-tag">🔤 Romanised English (Hinglish)</span>
+                      <button 
+                        className="copy-btn"
+                        onClick={() => copyToClipboard(res.romanised, `${res.model_id}_rom`)}
+                      >
+                        {copiedKey === `${res.model_id}_rom` ? '✓ Copied' : 'Copy'}
+                      </button>
+                    </div>
+                    <div className="transcript-box romanised-text">
+                      {res.romanised || '(Transliteration not available)'}
+                    </div>
+                  </div>
+
+                  {/* Modality 3: English Translation */}
+                  <div className="modality-block">
+                    <div className="modality-header">
+                      <span className="modality-tag english-tag">🌐 Translated English</span>
+                      <button 
+                        className="copy-btn"
+                        onClick={() => copyToClipboard(res.english, `${res.model_id}_eng`)}
+                      >
+                        {copiedKey === `${res.model_id}_eng` ? '✓ Copied' : 'Copy'}
+                      </button>
+                    </div>
+                    <div className="transcript-box english-text">
+                      {res.english || '(Translation not available)'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

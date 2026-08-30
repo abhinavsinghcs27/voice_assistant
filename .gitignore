@@ -1,0 +1,32 @@
+# Virtual Environments
+venv/
+env/
+.venv/
+backend/venv/
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Node modules
+node_modules/
+frontend/node_modules/
+
+# Build artifacts
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Audio recordings and benchmark runtime files
+backend/recordings/*
+!backend/recordings/.gitkeep
+backend/results/*
+!backend/results/.gitkeep
