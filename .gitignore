@@ -3,6 +3,9 @@ venv/
 env/
 .venv/
 backend/venv/
+.env
+*.env
+backend/.env
 
 # Byte-compiled / cache files
 __pycache__/
