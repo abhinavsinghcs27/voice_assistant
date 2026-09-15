@@ -111,6 +111,11 @@ def to_english_translation(text: str) -> str:
 
     cleaned_text = text.strip()
 
+    # Pure Latin-script / Romanised Hinglish input is already "readable" English —
+    # skip the network round-trip entirely (was ~3.3s of latency every turn).
+    if not re.search(r'[\u0900-\u097F]', cleaned_text):
+        return cleaned_text
+
     # Short single-word edge cases
     if cleaned_text in ["है", "हैं", "हो", "था", "थी", "the"]:
         return "is / are / was"

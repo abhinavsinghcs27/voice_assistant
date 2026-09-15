@@ -20,15 +20,25 @@ export default function App() {
   const [benchmarkData, setBenchmarkData] = useState(null);
 
   // Voice Assistant State
-  const [sttModel, setSttModel] = useState('indic-conformer-onnx');
-  const [vaRecording, setVaRecording] = useState(false);
+  const [sttModel, setSttModel] = useState('groq-whisper-large-v3-turbo');
   const [vaTimer, setVaTimer] = useState(0);
-  const [vaAudioBlob, setVaAudioBlob] = useState(null);
-  const [vaAudioUrl, setVaAudioUrl] = useState(null);
-  const [vaAudioName, setVaAudioName] = useState('');
-  const [vaPipelineStage, setVaPipelineStage] = useState('idle'); // 'idle' | 'stt' | 'llm' | 'tts' | 'ready'
-  const [vaResult, setVaResult] = useState(null);
-  const [vaLoading, setVaLoading] = useState(false);
+
+  // Continuous Call State
+  const [vaCallActive, setVaCallActive] = useState(false);
+  const [vaPhase, setVaPhase] = useState('idle'); // 'idle' | 'greeting' | 'listening' | 'processing' | 'speaking' | 'ended'
+  const [vaGreeting, setVaGreeting] = useState('');
+  const [structuredFeedback, setStructuredFeedback] = useState(null);
+  
+  // Multi-Turn & Telemetry State
+  const [vaSessionId, setVaSessionId] = useState(null);
+  const [vaTurns, setVaTurns] = useState([]);
+  const [vaTelemetry, setVaTelemetry] = useState({
+    sentiment: 'neutral',
+    sentiment_score: 0.0,
+    csat_estimate: 3,
+    detected_intent: 'General Inquiry',
+    human_escalation_flag: false
+  });
 
   // Refs
   const bmMediaRecorderRef = useRef(null);
@@ -39,8 +49,25 @@ export default function App() {
   const vaMediaRecorderRef = useRef(null);
   const vaAudioChunksRef = useRef([]);
   const vaTimerRef = useRef(null);
-  const vaFileInputRef = useRef(null);
-  const vaAudioPlayerRef = useRef(null);
+
+  // Continuous Call Refs
+  const vaStreamRef = useRef(null);
+  const vaAudioCtxRef = useRef(null);
+  const vaAnalyserRef = useRef(null);
+  const vaSilenceTimerRef = useRef(null);
+  const vaSilenceStartRef = useRef(null);
+  const vaGreetAudioRef = useRef(null);
+  const vaLiveAudioRef = useRef(null);
+  const vaCallActiveRef = useRef(false);
+  const vaPhaseRef = useRef('idle');
+  const vaSessionIdRef = useRef(null);
+  const chatRef = useRef(null);
+
+  useEffect(() => {
+    if (chatRef.current) {
+      chatRef.current.scrollTop = chatRef.current.scrollHeight;
+    }
+  }, [vaTurns, vaGreeting, vaPhase]);
 
   useEffect(() => {
     fetch('/api/models')
@@ -70,6 +97,18 @@ export default function App() {
     const secs = (seconds % 60).toString().padStart(2, '0');
     return `${mins}:${secs}`;
   };
+
+  // Continuous Call: mirror state into refs for event handlers + cleanup on unmount
+  useEffect(() => { vaCallActiveRef.current = vaCallActive; }, [vaCallActive]);
+  useEffect(() => { vaPhaseRef.current = vaPhase; }, [vaPhase]);
+  useEffect(() => { vaSessionIdRef.current = vaSessionId; }, [vaSessionId]);
+  useEffect(() => {
+    return () => {
+      if (vaSilenceTimerRef.current) clearInterval(vaSilenceTimerRef.current);
+      if (vaStreamRef.current) vaStreamRef.current.getTracks().forEach((t) => t.stop());
+      if (vaAudioCtxRef.current && vaAudioCtxRef.current.state === 'running') vaAudioCtxRef.current.close();
+    };
+  }, []);
 
   // ==========================================
   // 1. BENCHMARK LOGIC
@@ -181,117 +220,236 @@ export default function App() {
   // ==========================================
   // 2. VOICE ASSISTANT LOGIC (STT -> LLM -> TTS)
   // ==========================================
-  const startVaRecording = async () => {
+
+  // ==========================================
+  // 3. CONTINUOUS CALL LOOP (hands-free)
+  // ==========================================
+  const playResponseAudio = (dataUrl) => {
+    const el = vaLiveAudioRef.current;
+    if (el && dataUrl) {
+      el.src = dataUrl;
+      el.play().catch((e) => console.log("Autoplay prevented by browser:", e));
+    }
+  };
+
+  const stopSilenceMonitor = () => {
+    if (vaSilenceTimerRef.current) {
+      clearInterval(vaSilenceTimerRef.current);
+      vaSilenceTimerRef.current = null;
+    }
+  };
+
+  const stopMicTracks = () => {
+    if (vaStreamRef.current) {
+      vaStreamRef.current.getTracks().forEach((t) => t.stop());
+      vaStreamRef.current = null;
+    }
+  };
+
+  const setupAnalyser = (stream) => {
+    if (!vaAudioCtxRef.current) {
+      vaAudioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const ctx = vaAudioCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.8;
+    source.connect(analyser);
+    vaAnalyserRef.current = analyser;
+  };
+
+  const startCall = async () => {
     setError(null);
-    setVaResult(null);
-    setVaPipelineStage('idle');
-    vaAudioChunksRef.current = [];
-
+    setStructuredFeedback(null);
+    setVaGreeting('');
+    setVaTurns([]);
+    setVaSessionId(null);
+    vaSessionIdRef.current = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
-
-      vaMediaRecorderRef.current = new MediaRecorder(stream, { mimeType });
-      vaMediaRecorderRef.current.ondataavailable = (e) => {
-        if (e.data.size > 0) vaAudioChunksRef.current.push(e.data);
-      };
-      vaMediaRecorderRef.current.onstop = () => {
-        const blob = new Blob(vaAudioChunksRef.current, { type: mimeType });
-        setVaAudioBlob(blob);
-        setVaAudioUrl(URL.createObjectURL(blob));
-        setVaAudioName(`mic_va_${new Date().toISOString().slice(11, 19).replace(/:/g, '-')}.webm`);
-      };
-
-      vaMediaRecorderRef.current.start();
-      setVaRecording(true);
-      setVaTimer(0);
-      vaTimerRef.current = setInterval(() => setVaTimer(prev => prev + 1), 1000);
+      if (!vaStreamRef.current) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        vaStreamRef.current = stream;
+        setupAnalyser(stream);
+      }
+      setVaCallActive(true);
+      startGreeting();
     } catch (err) {
       console.error(err);
       setError("Microphone access denied or audio device not found.");
     }
   };
 
-  const stopVaRecording = () => {
-    if (vaMediaRecorderRef.current && vaRecording) {
-      vaMediaRecorderRef.current.stop();
-      vaMediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
-      clearInterval(vaTimerRef.current);
-      setVaRecording(false);
+  const startGreeting = async () => {
+    setVaPhase('greeting');
+    setVaTurns([]);
+    try {
+      const res = await fetch('/api/voice-assistant/greet', { method: 'POST' });
+      if (!res.ok) {
+        const ed = await res.json();
+        throw new Error(ed.detail || 'Greeting failed.');
+      }
+      const data = await res.json();
+      setVaGreeting(data.text);
+      const el = vaGreetAudioRef.current;
+      if (el && data.audio_url) {
+        el.src = data.audio_url;
+        el.play().catch((e) => console.log("Greeting autoplay blocked:", e));
+      } else {
+        startListening();
+      }
+    } catch (err) {
+      setError(err.message);
+      setVaCallActive(false);
+      setVaPhase('idle');
+      stopMicTracks();
     }
   };
 
-  const handleVaFileUpload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    setError(null);
-    setVaResult(null);
-    setVaPipelineStage('idle');
-    setVaAudioBlob(file);
-    setVaAudioUrl(URL.createObjectURL(file));
-    setVaAudioName(file.name);
-  };
-
-  const discardVaAudio = () => {
-    if (vaAudioUrl) URL.revokeObjectURL(vaAudioUrl);
-    setVaAudioBlob(null);
-    setVaAudioUrl(null);
-    setVaAudioName('');
-    setVaResult(null);
-    setVaPipelineStage('idle');
-    setVaTimer(0);
-    if (vaFileInputRef.current) vaFileInputRef.current.value = '';
-  };
-
-  const runVoiceAssistant = async () => {
-    if (!vaAudioBlob) {
-      setError("No audio recording or file selected.");
-      return;
+  const startListening = () => {
+    if (!vaCallActiveRef.current || !vaStreamRef.current) return;
+    vaAudioChunksRef.current = [];
+    try {
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+      const recorder = new MediaRecorder(vaStreamRef.current, { mimeType });
+      vaMediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) vaAudioChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        const blob = new Blob(vaAudioChunksRef.current, { type: mimeType });
+        vaAudioChunksRef.current = [];
+        if (vaCallActiveRef.current) submitTurn(blob);
+      };
+      recorder.start();
+      setVaPhase('listening');
+      setVaTimer(0);
+      vaTimerRef.current = setInterval(() => setVaTimer((prev) => prev + 1), 1000);
+      startSilenceMonitor();
+    } catch (err) {
+      console.error(err);
+      setError("Could not start recording.");
     }
+  };
 
-    setVaLoading(true);
-    setError(null);
-    setVaPipelineStage('stt');
+  const startSilenceMonitor = () => {
+    stopSilenceMonitor();
+    vaSilenceStartRef.current = null;
+    vaSilenceTimerRef.current = setInterval(() => {
+      const analyser = vaAnalyserRef.current;
+      if (!analyser) return;
+      const buf = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / buf.length);
+      if (rms < 0.02) {
+        if (vaSilenceStartRef.current === null) {
+          vaSilenceStartRef.current = Date.now();
+        } else if (Date.now() - vaSilenceStartRef.current >= 1500) {
+          stopAndSubmitTurn();
+        }
+      } else {
+        vaSilenceStartRef.current = null;
+      }
+    }, 250);
+  };
 
+  const stopAndSubmitTurn = () => {
+    stopSilenceMonitor();
+    clearInterval(vaTimerRef.current);
+    const recorder = vaMediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      setVaPhase('processing');
+      recorder.stop();
+    }
+  };
+
+  const submitTurn = async (blob) => {
+    if (!vaCallActiveRef.current) return;
+    setVaPhase('processing');
     const formData = new FormData();
-    formData.append('audio', vaAudioBlob, vaAudioName || 'voice_query.webm');
+    formData.append('audio', blob, `turn_${Date.now()}.webm`);
     formData.append('stt_model', sttModel);
-
-    // Simulate progress updates for stages
-    const stageTimer1 = setTimeout(() => setVaPipelineStage('llm'), 600);
-    const stageTimer2 = setTimeout(() => setVaPipelineStage('tts'), 1400);
+    if (vaSessionIdRef.current) formData.append('session_id', vaSessionIdRef.current);
 
     try {
       const response = await fetch('/api/voice-assistant/interact', {
         method: 'POST',
         body: formData,
       });
-
-      clearTimeout(stageTimer1);
-      clearTimeout(stageTimer2);
-
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.detail || 'Voice Assistant pipeline execution failed.');
+        throw new Error(errorData.detail || 'Voice turn processing failed.');
       }
-
       const data = await response.json();
-      setVaResult(data);
-      setVaPipelineStage('ready');
+      vaSessionIdRef.current = data.session_id;
+      setVaSessionId(data.session_id);
+      if (data.telemetry) setVaTelemetry(data.telemetry);
 
-      // Auto-play AI response audio
-      if (data.audio_url) {
-        setTimeout(() => {
-          if (vaAudioPlayerRef.current) {
-            vaAudioPlayerRef.current.play().catch(e => console.log("Auto-play prevented by browser:", e));
-          }
-        }, 300);
-      }
+      const newTurn = {
+        id: data.id,
+        user_transcript: data.user_transcript,
+        llm_response: data.llm_response,
+        audio_url: data.audio_url,
+        latency: data.latency,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      };
+      setVaTurns((prev) => [...prev, newTurn]);
+      setVaPhase('speaking');
+      playResponseAudio(data.audio_url);
     } catch (err) {
       setError(err.message);
-      setVaPipelineStage('idle');
-    } finally {
-      setVaLoading(false);
+      if (vaCallActiveRef.current) startListening();
+    }
+  };
+
+  const handleLiveAudioEnded = () => {
+    if (vaCallActiveRef.current && vaPhaseRef.current === 'speaking') {
+      setTimeout(() => startListening(), 400);
+    }
+  };
+
+  const handleGreetAudioEnded = () => {
+    if (vaCallActiveRef.current) startListening();
+  };
+
+  const endCall = async () => {
+    stopSilenceMonitor();
+    clearInterval(vaTimerRef.current);
+    const recorder = vaMediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    vaCallActiveRef.current = false;
+    setVaCallActive(false);
+    setVaPhase('speaking');
+    stopMicTracks();
+    await finalizeSession();
+  };
+
+  const finalizeSession = async () => {
+    if (!vaSessionIdRef.current) {
+      setError("No active conversation to finalize.");
+      return;
+    }
+    try {
+      const formData = new FormData();
+      formData.append('session_id', vaSessionIdRef.current);
+      const res = await fetch('/api/voice-assistant/finalize', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.detail || 'Finalize failed.');
+      }
+      const data = await res.json();
+      setStructuredFeedback(data.structured_feedback);
+    } catch (err) {
+      setError(err.message);
     }
   };
 
@@ -329,17 +487,32 @@ export default function App() {
       )}
 
       {/* ==================================================================== */}
-      {/* TAB 1: VOICE ASSISTANT PIPELINE */}
+      {/* TAB 1: VOICE ASSISTANT PIPELINE (MULTI-TURN + TELEMETRY) */}
       {/* ==================================================================== */}
       {activeTab === 'assistant' && (
         <div className="tab-content">
+          {/* Session Header Bar */}
+          <div className="session-bar">
+            <div className="session-info">
+              <span>💬 Session Context:</span>
+              <span className="session-badge">{vaSessionId || 'New Session'}</span>
+              <span>• Turns: <strong>{vaTurns.length}</strong></span>
+              {vaCallActive && <span className="call-live-tag">🟢 Call Live</span>}
+            </div>
+            {vaCallActive && (
+              <button className="btn-reset-session end-call-btn" onClick={endCall}>
+                🔴 End Call
+              </button>
+            )}
+          </div>
+
           {/* Controls & Engine Selection */}
           <div className="card">
             <div className="section-header">
               <div className="section-title">
                 <span>⚡</span> Pipeline Engine Settings
               </div>
-              <span className="section-hint">STT Model + Groq LLM + gTTS</span>
+              <span className="section-hint">STT Model + Groq LLM + Edge-TTS</span>
             </div>
 
             <div className="assistant-settings-grid">
@@ -349,11 +522,11 @@ export default function App() {
                   className="setting-select"
                   value={sttModel}
                   onChange={(e) => setSttModel(e.target.value)}
-                  disabled={vaRecording || vaLoading}
+                  disabled={vaCallActive}
                 >
                   {models.map(m => (
                     <option key={m.id} value={m.id}>
-                      {m.name} {m.id === 'indic-conformer-onnx' ? '⚡ (Sub-200ms CPU)' : ''}
+                      {m.name} {m.id === 'groq-whisper-large-v3-turbo' ? '☁️ (Cloud GPU)' : m.id === 'indic-conformer-onnx' ? '⚡ (Sub-200ms CPU)' : ''}
                     </option>
                   ))}
                 </select>
@@ -362,14 +535,14 @@ export default function App() {
               <div className="setting-box">
                 <label className="setting-label">LLM Engine (Reasoning)</label>
                 <div className="static-badge-box">
-                  🤖 <strong>Groq openai/gpt-oss-20b</strong> <span className="speed-tag">Sub-500ms</span>
+                  🤖 <strong>Groq openai/gpt-oss-20b</strong> <span className="speed-tag">Multi-Turn Context</span>
                 </div>
               </div>
 
               <div className="setting-box">
                 <label className="setting-label">Voice Synthesis (TTS)</label>
                 <div className="static-badge-box">
-                  🔊 <strong>gTTS In-Memory Neural Voice</strong> <span className="speed-tag">MP3 Stream</span>
+                  🔊 <strong>Edge-TTS Natural Neural Voice</strong> <span className="speed-tag">Hi-IN / En-IN</span>
                 </div>
               </div>
             </div>
@@ -379,182 +552,262 @@ export default function App() {
           <div className="card">
             <div className="section-header">
               <div className="section-title">
-                <span>🎙️</span> User Voice Query
+                <span>🎙️</span> {vaCallActive ? 'Call In Progress' : 'Voice Call'}
               </div>
-              <span className="section-hint">Speak in Hindi or Hinglish</span>
+              <span className="section-hint">
+                {vaCallActive
+                  ? '🔄 Hands-free — mic auto-starts after the AI finishes speaking'
+                  : 'Start a call to begin collecting feedback'}
+              </span>
             </div>
 
-            <div className="audio-capture-box">
-              <div className={`mic-circle ${vaRecording ? 'recording' : ''}`}>
-                {vaRecording ? '⏺️' : '🎙️'}
-              </div>
-
-              {vaRecording && (
-                <div className="recording-timer">{formatTime(vaTimer)}</div>
-              )}
-
-              <div className="btn-group">
-                {!vaRecording ? (
-                  <>
-                    <button
-                      className="btn btn-record"
-                      onClick={startVaRecording}
-                      disabled={vaLoading}
-                    >
-                      <span>⏺️</span> {vaAudioUrl ? 'Record New Query' : 'Speak Now'}
-                    </button>
-
-                    <label className="btn btn-upload-label" style={{ cursor: vaLoading ? 'not-allowed' : 'pointer' }}>
-                      <span>📁</span> Upload Audio File
-                      <input
-                        ref={vaFileInputRef}
-                        type="file"
-                        accept="audio/*,.wav,.mp3,.webm,.m4a,.ogg"
-                        style={{ display: 'none' }}
-                        onChange={handleVaFileUpload}
-                        disabled={vaLoading}
-                      />
-                    </label>
-                  </>
-                ) : (
-                  <button className="btn btn-stop" onClick={stopVaRecording}>
-                    <span>⏹️</span> Stop & Process
+            {/* Idle — Start Call (the only button here) */}
+            {!vaCallActive && (
+              <div className="audio-capture-box">
+                <div className="btn-group">
+                  <button className="btn btn-primary btn-start-call" onClick={startCall}>
+                    <span>▶️</span> Start Call
                   </button>
-                )}
-              </div>
-
-              {/* Audio Preview & Interact Button */}
-              {vaAudioUrl && !vaRecording && (
-                <div className="audio-preview-box">
-                  <div className="audio-preview-header">
-                    <span>🎵 <strong>{vaAudioName || 'User Audio Ready'}</strong></span>
-                    <span>Ready for AI Processing</span>
-                  </div>
-                  
-                  <audio controls src={vaAudioUrl} />
-
-                  <div className="btn-group" style={{ marginTop: '0.75rem' }}>
-                    <button
-                      className="btn btn-primary btn-interact"
-                      onClick={runVoiceAssistant}
-                      disabled={vaLoading}
-                    >
-                      <span>⚡</span> {vaLoading ? 'Processing Voice Assistant Loop...' : 'Send Voice Query to Assistant'}
-                    </button>
-
-                    <button
-                      className="btn btn-discard"
-                      onClick={discardVaAudio}
-                      disabled={vaLoading}
-                    >
-                      <span>🗑️</span> Discard
-                    </button>
-                  </div>
                 </div>
-              )}
-            </div>
+              </div>
+            )}
+
+            {/* Greeting phase */}
+            {vaCallActive && vaPhase === 'greeting' && (
+              <div className="status-box">
+                <div className="mic-circle speaking">👋</div>
+                <p className="status-text">{vaGreeting || 'Greeting...'}</p>
+                <audio ref={vaGreetAudioRef} onEnded={handleGreetAudioEnded} style={{ display: 'none' }} />
+              </div>
+            )}
+
+            {/* Listening phase — user is speaking */}
+            {vaCallActive && vaPhase === 'listening' && (
+              <div className="audio-capture-box">
+                <div className="mic-circle recording">⏺️</div>
+                <div className="recording-timer">{formatTime(vaTimer)}</div>
+                <div className="listening-hint">🗣️ Listening… speak now — turn auto-submits after 1.5s of silence</div>
+              </div>
+            )}
+
+            {/* Processing / Speaking phases */}
+            {(vaCallActive && (vaPhase === 'processing' || vaPhase === 'speaking')) && (
+              <div className="status-box">
+                <div className={vaPhase === 'processing' ? 'cs-spinner' : 'mic-circle speaking'}>
+                  {vaPhase === 'processing' ? '⚙️' : '🔊'}
+                </div>
+                <p className="status-text">
+                  {vaPhase === 'processing'
+                    ? 'Processing turn (STT → LLM → TTS)…'
+                    : 'Assistant speaking… mic will auto-start after.'}
+                </p>
+                <audio ref={vaLiveAudioRef} onEnded={handleLiveAudioEnded} style={{ display: 'none' }} />
+              </div>
+            )}
           </div>
 
-          {/* Pipeline Stage Indicator */}
-          {vaLoading && (
-            <div className="pipeline-status-card">
-              <div className="pipeline-steps">
-                <div className={`pipeline-step ${vaPipelineStage === 'stt' ? 'active' : 'done'}`}>
-                  <span className="step-icon">⚡</span>
-                  <span className="step-label">1. STT Audio Transcription</span>
+          {/* Real-Time Sentiment & Telemetry Dashboard */}
+          {vaTurns.length > 0 && (
+            <div className="telemetry-card">
+              <div className="section-header">
+                <div className="section-title">
+                  <span>📊</span> Real-Time Session Telemetry & Sentiment Dashboard
                 </div>
-                <div className="step-arrow">→</div>
-                <div className={`pipeline-step ${vaPipelineStage === 'llm' ? 'active' : vaPipelineStage === 'tts' || vaPipelineStage === 'ready' ? 'done' : ''}`}>
-                  <span className="step-icon">🧠</span>
-                  <span className="step-label">2. Groq LLM Reasoning</span>
+                <span className="section-hint">Post-Call Telemetry Extraction</span>
+              </div>
+
+              <div className="telemetry-grid">
+                <div className="telemetry-item">
+                  <span className="telemetry-label">Detected Sentiment</span>
+                  <div className={`sentiment-badge ${vaTelemetry.sentiment}`}>
+                    {vaTelemetry.sentiment === 'positive' && '🟢 Positive'}
+                    {vaTelemetry.sentiment === 'neutral' && '🟡 Neutral'}
+                    {vaTelemetry.sentiment === 'frustrated' && '🔴 Frustrated Customer'}
+                  </div>
                 </div>
-                <div className="step-arrow">→</div>
-                <div className={`pipeline-step ${vaPipelineStage === 'tts' ? 'active' : vaPipelineStage === 'ready' ? 'done' : ''}`}>
-                  <span className="step-icon">🔊</span>
-                  <span className="step-label">3. gTTS Voice Synthesis</span>
+
+                <div className="telemetry-item">
+                  <span className="telemetry-label">Estimated CSAT Rating</span>
+                  <div className="csat-stars">
+                    {'★'.repeat(vaTelemetry.csat_estimate)}{'☆'.repeat(5 - vaTelemetry.csat_estimate)}
+                    <span style={{ fontSize: '0.85rem', color: '#94a3b8', marginLeft: '0.5rem' }}>
+                      ({vaTelemetry.csat_estimate}/5)
+                    </span>
+                  </div>
                 </div>
+
+                <div className="telemetry-item">
+                  <span className="telemetry-label">Detected Customer Intent</span>
+                  <div className="intent-tag">
+                    🏷️ {vaTelemetry.detected_intent}
+                  </div>
+                </div>
+
+                <div className="telemetry-item">
+                  <span className="telemetry-label">Human Escalation Status</span>
+                  <div style={{ fontSize: '0.9rem', fontWeight: '700', color: vaTelemetry.human_escalation_flag ? '#f87171' : '#34d399' }}>
+                    {vaTelemetry.human_escalation_flag ? '⚠️ Escalation Flagged' : '✅ Handled by Voice AI'}
+                  </div>
+                </div>
+              </div>
+
+              {vaTelemetry.human_escalation_flag && (
+                <div className="escalation-banner">
+                  <span>⚠️</span> <strong>Escalation Warning:</strong> High frustration or explicit human agent request detected. Flagged for Razorpay Support CRM routing.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Full-Conversation Chat Transcript */}
+          {(vaTurns.length > 0 || vaGreeting) && (
+            <div className="card chat-card">
+              <div className="section-header">
+                <div className="section-title">
+                  <span>💬</span> Conversation
+                </div>
+                <span className="section-hint">Full call transcript in chat form</span>
+              </div>
+
+              <div className="chat-container" ref={chatRef}>
+                {vaGreeting && (
+                  <div className="chat-msg assistant">
+                    <div className="chat-bubble">
+                      <div className="chat-meta">
+                        <span className="chat-name">Vaani</span>
+                      </div>
+                      <div className="chat-text">{vaGreeting}</div>
+                    </div>
+                  </div>
+                )}
+
+                {vaTurns.map((turn, idx) => (
+                  <div className="chat-turn" key={turn.id || idx}>
+                    {/* User */}
+                    <div className="chat-msg user">
+                      <div className="chat-bubble">
+                        <div className="chat-meta">
+                          <span className="chat-name">You</span>
+                          <span className="chat-time">{turn.timestamp}</span>
+                        </div>
+                        <div className="chat-text devanagari-text">
+                          {turn.user_transcript.devanagari || turn.user_transcript.raw || '(No speech recognized)'}
+                        </div>
+                        {turn.user_transcript.romanised && (
+                          <div className="chat-sub">🔤 {turn.user_transcript.romanised}</div>
+                        )}
+                        {turn.user_transcript.english && (
+                          <div className="chat-sub">🌐 {turn.user_transcript.english}</div>
+                        )}
+                        {turn.latency && (
+                          <div className="chat-latency">
+                            ⚡ {turn.latency.total_seconds}s total (STT {turn.latency.stt_seconds}s · LLM {turn.latency.llm_seconds}s · TTS {turn.latency.tts_seconds}s)
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Assistant */}
+                    <div className="chat-msg assistant">
+                      <div className="chat-bubble">
+                        <div className="chat-meta">
+                          <span className="chat-name">Vaani <span className="chat-model">({turn.llm_response.model_used})</span></span>
+                          <span className="chat-time">{turn.timestamp}</span>
+                        </div>
+                        <div className="chat-text">"{turn.llm_response.text}"</div>
+                        {turn.audio_url && (
+                          <div className="chat-audio">
+                            <audio controls src={turn.audio_url} />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           )}
 
-          {/* Assistant Result Card */}
-          {vaResult && (
-            <div className="va-response-container">
-              {/* Latency Summary Bar */}
-              <div className="latency-bar">
-                <span className="latency-chip total">
-                  ⚡ <strong>Total Turn: {vaResult.latency.total_seconds}s</strong>
-                </span>
-                <span className="latency-chip">
-                  🎙️ STT: {vaResult.latency.stt_seconds}s
-                </span>
-                <span className="latency-chip">
-                  🧠 LLM: {vaResult.latency.llm_seconds}s
-                </span>
-                <span className="latency-chip">
-                  🔊 TTS: {vaResult.latency.tts_seconds}s
+          {/* Post-Call Feedback Report (Phase 2) */}
+          {structuredFeedback && (
+            <div className="report-card">
+              <div className="section-header">
+                <div className="section-title">
+                  <span>📋</span> Post-Call Feedback Report
+                </div>
+                <span className="report-saved-hint">
+                  💾 Saved: backend/post-call-analysis/{structuredFeedback.record_id || ''}_feedback.json
                 </span>
               </div>
 
-              <div className="dialogue-grid">
-                {/* User Spoken Input Card */}
-                <div className="dialogue-card user-card">
-                  <div className="dialogue-header">
-                    <span className="user-tag">👤 User Spoken Speech</span>
-                    <button 
-                      className="copy-btn"
-                      onClick={() => copyToClipboard(vaResult.user_transcript.devanagari || vaResult.user_transcript.raw, 'user_text')}
-                    >
-                      {copiedKey === 'user_text' ? '✓ Copied' : 'Copy'}
-                    </button>
+              <div className="report-grid">
+                <div className="report-item">
+                  <span className="report-label">Overall Sentiment</span>
+                  <div className={`sentiment-badge ${structuredFeedback.aggregate_sentiment || 'neutral'}`}>
+                    {structuredFeedback.aggregate_sentiment || 'neutral'}
                   </div>
-
-                  <div className="transcript-box devanagari-text">
-                    {vaResult.user_transcript.devanagari || vaResult.user_transcript.raw || '(No speech recognized)'}
-                  </div>
-
-                  {vaResult.user_transcript.romanised && (
-                    <div className="sub-transcript-block">
-                      <span className="sub-tag">🔤 Hinglish:</span> {vaResult.user_transcript.romanised}
-                    </div>
-                  )}
-
-                  {vaResult.user_transcript.english && (
-                    <div className="sub-transcript-block">
-                      <span className="sub-tag">🌐 English:</span> {vaResult.user_transcript.english}
-                    </div>
-                  )}
                 </div>
 
-                {/* AI Spoken Response Card */}
-                <div className="dialogue-card assistant-card">
-                  <div className="dialogue-header">
-                    <span className="ai-tag">🤖 AI Spoken Response ({vaResult.llm_response.model_used})</span>
-                    <button 
-                      className="copy-btn"
-                      onClick={() => copyToClipboard(vaResult.llm_response.text, 'ai_text')}
-                    >
-                      {copiedKey === 'ai_text' ? '✓ Copied' : 'Copy'}
-                    </button>
+                <div className="report-item">
+                  <span className="report-label">Satisfaction Rating</span>
+                  <div className="csat-stars">
+                    {'★'.repeat(structuredFeedback.overall_satisfaction)}{'☆'.repeat(5 - structuredFeedback.overall_satisfaction)}
+                    <span style={{ fontSize: '0.85rem', color: '#94a3b8', marginLeft: '0.5rem' }}>
+                      ({structuredFeedback.overall_satisfaction}/5)
+                    </span>
                   </div>
-
-                  <div className="assistant-text-box">
-                    "{vaResult.llm_response.text}"
-                  </div>
-
-                  {/* Audio Player for Voice Response */}
-                  {vaResult.audio_url && (
-                    <div className="ai-audio-player-wrapper">
-                      <span className="player-title">🔊 Listen to AI Voice Response:</span>
-                      <audio 
-                        ref={vaAudioPlayerRef} 
-                        controls 
-                        autoPlay 
-                        src={vaResult.audio_url} 
-                      />
-                    </div>
-                  )}
                 </div>
+
+                <div className="report-item">
+                  <span className="report-label">Resolution Status</span>
+                  <div className="intent-tag">
+                    {structuredFeedback.resolution_status || 'resolved'}
+                    {structuredFeedback.follow_up_required ? ' • ⚠️ Follow-up required' : ''}
+                  </div>
+                </div>
+              </div>
+
+              <div className="report-columns">
+                <div className="report-column">
+                  <div className="report-col-title">⚠️ Complaints</div>
+                  <ul className="report-list">
+                    {(structuredFeedback.primary_complaints && structuredFeedback.primary_complaints.length)
+                      ? structuredFeedback.primary_complaints.map((c, i) => <li key={i}>{c}</li>)
+                      : <li className="report-empty">None recorded</li>}
+                  </ul>
+                </div>
+
+                <div className="report-column">
+                  <div className="report-col-title">✅ Positive Highlights</div>
+                  <ul className="report-list">
+                    {(structuredFeedback.positive_highlights && structuredFeedback.positive_highlights.length)
+                      ? structuredFeedback.positive_highlights.map((c, i) => <li key={i}>{c}</li>)
+                      : <li className="report-empty">None recorded</li>}
+                  </ul>
+                </div>
+
+                <div className="report-column">
+                  <div className="report-col-title">🎯 Action Items</div>
+                  <ul className="report-list">
+                    {(structuredFeedback.action_items && structuredFeedback.action_items.length)
+                      ? structuredFeedback.action_items.map((c, i) => <li key={i}>{c}</li>)
+                      : <li className="report-empty">None required</li>}
+                  </ul>
+                </div>
+              </div>
+
+              {structuredFeedback.key_topics && structuredFeedback.key_topics.length > 0 && (
+                <div className="report-topics">
+                  <span className="report-label">Key Topics:</span>{' '}
+                  {structuredFeedback.key_topics.map((t, i) => (
+                    <span className="topic-tag" key={i}>{t}</span>
+                  ))}
+                </div>
+              )}
+
+              <div className="report-summary">
+                <p><strong>Summary (Hindi):</strong> {structuredFeedback.summary_hindi || '—'}</p>
+                <p><strong>Summary (English):</strong> {structuredFeedback.summary_english || '—'}</p>
               </div>
             </div>
           )}

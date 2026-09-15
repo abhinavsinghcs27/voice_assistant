@@ -1,3 +1,4 @@
+import io
 import time
 from typing import Dict, Any
 from faster_whisper import WhisperModel
@@ -17,13 +18,14 @@ class FasterWhisperProvider(STTProvider):
         self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
         print("Model loaded successfully.")
 
-    def transcribe(self, audio_path: str, language: str = None) -> Dict[str, Any]:
+    def _transcribe_source(self, source, language: str = None) -> Dict[str, Any]:
+        """Core transcription for a path or an in-memory file-like object."""
         start_time = time.time()
 
         try:
             # Enable VAD filter to strip leading/trailing silence and prevent hallucinations
             segments, info = self.model.transcribe(
-                audio_path,
+                source,
                 beam_size=5,
                 language=language if language else None,
                 task="transcribe",
@@ -34,7 +36,7 @@ class FasterWhisperProvider(STTProvider):
 
             # Combine transcribed segments
             transcript_text = " ".join([segment.text for segment in segments]).strip()
-            
+
             # Check for known silence hallucinations
             if transcript_text.lower().strip() in HALLUCINATIONS:
                 transcript_text = ""
@@ -53,3 +55,10 @@ class FasterWhisperProvider(STTProvider):
             "audio_duration": duration,
             "processing_time": round(processing_time, 2)
         }
+
+    def transcribe(self, audio_path: str, language: str = None) -> Dict[str, Any]:
+        return self._transcribe_source(audio_path, language)
+
+    def transcribe_buffer(self, audio_data: bytes, language: str = None) -> Dict[str, Any]:
+        """Transcribe raw audio bytes fully in memory, no disk file required."""
+        return self._transcribe_source(io.BytesIO(audio_data), language)

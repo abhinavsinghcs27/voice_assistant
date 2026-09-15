@@ -33,3 +33,9 @@ backend/recordings/*
 !backend/recordings/.gitkeep
 backend/results/*
 !backend/results/.gitkeep
+backend/post-call-analysis/*
+!backend/post-call-analysis/.gitkeep
+
+# Server logs
+backend/server_out.log
+backend/server_err.log
