@@ -2,12 +2,51 @@ import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('assistant'); // 'assistant' or 'benchmark'
+  const [activeTab, setActiveTab] = useState('assistant'); // 'assistant' | 'analytics' | 'benchmark'
 
   // Common State
   const [models, setModels] = useState([]);
+  const [ttsEngines, setTtsEngines] = useState([]);
+  const [personas, setPersonas] = useState([]);
   const [error, setError] = useState(null);
   const [copiedKey, setCopiedKey] = useState(null);
+
+  // Settings & Persona State
+  const [sttModel, setSttModel] = useState('indic-conformer-onnx');
+  const [ttsEngine, setTtsEngine] = useState('edge-tts');
+  const [selectedPersonaId, setSelectedPersonaId] = useState('vaani_inbound');
+  const [customSystemPrompt, setCustomSystemPrompt] = useState('');
+  const [customGreeting, setCustomGreeting] = useState('');
+  const [vadThresholdSeconds, setVadThresholdSeconds] = useState(1.2); // 0.6s to 2.5s
+  const [showPromptEditor, setShowPromptEditor] = useState(false);
+
+  // Voice Assistant Live Call State
+  const [vaCallActive, setVaCallActive] = useState(false);
+  const [vaPhase, setVaPhase] = useState('idle'); // 'idle' | 'greeting' | 'listening' | 'processing' | 'speaking'
+  const [vaGreeting, setVaGreeting] = useState('');
+  const [vaTimer, setVaTimer] = useState(0);
+  const [vaSessionId, setVaSessionId] = useState(null);
+  const [vaTurns, setVaTurns] = useState([]);
+  const [bargeInOccurred, setBargeInOccurred] = useState(false);
+  const [vaTelemetry, setVaTelemetry] = useState({
+    sentiment: 'neutral',
+    sentiment_score: 0.0,
+    csat_estimate: 3,
+    detected_intent: 'General Inquiry',
+    human_escalation_flag: false,
+    slots: {}
+  });
+  const [latestFeedbackReport, setLatestFeedbackReport] = useState(null);
+
+  // Analytics & Call Log State
+  const [analyticsData, setAnalyticsData] = useState({
+    total_calls: 0,
+    average_csat: 0.0,
+    positive_sentiment_percent: 0.0,
+    escalation_count: 0
+  });
+  const [callLogs, setCallLogs] = useState([]);
+  const [selectedReportModal, setSelectedReportModal] = useState(null);
 
   // Benchmark State
   const [selectedModels, setSelectedModels] = useState([]);
@@ -16,78 +55,91 @@ export default function App() {
   const [bmAudioBlob, setBmAudioBlob] = useState(null);
   const [bmAudioUrl, setBmAudioUrl] = useState(null);
   const [bmAudioName, setBmAudioName] = useState('');
+  const [bmReferenceText, setBmReferenceText] = useState('');
   const [bmLoading, setBmLoading] = useState(false);
   const [benchmarkData, setBenchmarkData] = useState(null);
 
-  // Voice Assistant State
-  const [sttModel, setSttModel] = useState('groq-whisper-large-v3-turbo');
-  const [vaTimer, setVaTimer] = useState(0);
+  // Refs for Audio & VAD
+  const vaStreamRef = useRef(null);
+  const vaAudioCtxRef = useRef(null);
+  const vaAnalyserRef = useRef(null);
+  const vaMediaRecorderRef = useRef(null);
+  const vaAudioChunksRef = useRef([]);
+  const vaSilenceTimerRef = useRef(null);
+  const vaSilenceStartRef = useRef(null);
+  const vaPlaybackStartTimeRef = useRef(0);
+  const vaTimerRef = useRef(null);
+  const vaLiveAudioRef = useRef(null);
+  const vaGreetAudioRef = useRef(null);
+  const vaCallActiveRef = useRef(false);
+  const vaPhaseRef = useRef('idle');
+  const vaSessionIdRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const chatRef = useRef(null);
+  const canvasRef = useRef(null);
+  const animFrameIdRef = useRef(null);
 
-  // Continuous Call State
-  const [vaCallActive, setVaCallActive] = useState(false);
-  const [vaPhase, setVaPhase] = useState('idle'); // 'idle' | 'greeting' | 'listening' | 'processing' | 'speaking' | 'ended'
-  const [vaGreeting, setVaGreeting] = useState('');
-  const [structuredFeedback, setStructuredFeedback] = useState(null);
-  
-  // Multi-Turn & Telemetry State
-  const [vaSessionId, setVaSessionId] = useState(null);
-  const [vaTurns, setVaTurns] = useState([]);
-  const [vaTelemetry, setVaTelemetry] = useState({
-    sentiment: 'neutral',
-    sentiment_score: 0.0,
-    csat_estimate: 3,
-    detected_intent: 'General Inquiry',
-    human_escalation_flag: false
-  });
-
-  // Refs
+  // Benchmark Refs
   const bmMediaRecorderRef = useRef(null);
   const bmAudioChunksRef = useRef([]);
   const bmTimerRef = useRef(null);
   const bmFileInputRef = useRef(null);
 
-  const vaMediaRecorderRef = useRef(null);
-  const vaAudioChunksRef = useRef([]);
-  const vaTimerRef = useRef(null);
+  // Synchronize state changes to refs
+  const updateVaPhase = (phase) => {
+    vaPhaseRef.current = phase;
+    setVaPhase(phase);
+  };
 
-  // Continuous Call Refs
-  const vaStreamRef = useRef(null);
-  const vaAudioCtxRef = useRef(null);
-  const vaAnalyserRef = useRef(null);
-  const vaSilenceTimerRef = useRef(null);
-  const vaSilenceStartRef = useRef(null);
-  const vaGreetAudioRef = useRef(null);
-  const vaLiveAudioRef = useRef(null);
-  const vaCallActiveRef = useRef(false);
-  const vaPhaseRef = useRef('idle');
-  const vaSessionIdRef = useRef(null);
-  const chatRef = useRef(null);
+  useEffect(() => { vaCallActiveRef.current = vaCallActive; }, [vaCallActive]);
+  useEffect(() => { vaSessionIdRef.current = vaSessionId; }, [vaSessionId]);
 
+  // Initial Data Fetch
+  useEffect(() => {
+    Promise.all([
+      fetch('/api/models').then(r => r.json()).catch(() => []),
+      fetch('/api/tts/engines').then(r => r.json()).catch(() => []),
+      fetch('/api/personas').then(r => r.json()).catch(() => [])
+    ]).then(([modelsList, ttsList, personasList]) => {
+      setModels(modelsList);
+      setSelectedModels(modelsList.map(m => m.id));
+      setTtsEngines(ttsList);
+      setPersonas(personasList);
+
+      if (personasList.length > 0) {
+        const def = personasList.find(p => p.id === 'vaani_inbound') || personasList[0];
+        setSelectedPersonaId(def.id);
+        setCustomSystemPrompt(def.system_prompt);
+        setCustomGreeting(def.greeting);
+      }
+    }).catch(err => {
+      console.error(err);
+      setError("Failed to initialize system models & persona configurations.");
+    });
+
+    fetchAnalytics();
+  }, []);
+
+  const fetchAnalytics = () => {
+    fetch('/api/voice-assistant/reports')
+      .then(r => r.json())
+      .then(data => {
+        if (data.analytics) setAnalyticsData(data.analytics);
+        if (data.reports) setCallLogs(data.reports);
+      })
+      .catch(e => console.log("Analytics load:", e));
+  };
+
+  // Scroll chat on updates
   useEffect(() => {
     if (chatRef.current) {
       chatRef.current.scrollTop = chatRef.current.scrollHeight;
     }
   }, [vaTurns, vaGreeting, vaPhase]);
 
-  useEffect(() => {
-    fetch('/api/models')
-      .then((res) => {
-        if (!res.ok) throw new Error("Could not fetch models");
-        return res.json();
-      })
-      .then((data) => {
-        setModels(data);
-        setSelectedModels(data.map(m => m.id));
-      })
-      .catch((err) => {
-        console.error(err);
-        setError("Failed to connect to backend STT service at http://127.0.0.1:8000.");
-      });
-  }, []);
-
-  // --- Copy Helper ---
+  // Copy helper
   const copyToClipboard = (text, key) => {
-    navigator.clipboard.writeText(text);
+    navigator.clipboard.writeText(typeof text === 'object' ? JSON.stringify(text, null, 2) : text);
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
   };
@@ -98,25 +150,475 @@ export default function App() {
     return `${mins}:${secs}`;
   };
 
-  // Continuous Call: mirror state into refs for event handlers + cleanup on unmount
-  useEffect(() => { vaCallActiveRef.current = vaCallActive; }, [vaCallActive]);
-  useEffect(() => { vaPhaseRef.current = vaPhase; }, [vaPhase]);
-  useEffect(() => { vaSessionIdRef.current = vaSessionId; }, [vaSessionId]);
+  // Persona Selector Change Handler
+  const handlePersonaChange = (e) => {
+    const pId = e.target.value;
+    setSelectedPersonaId(pId);
+    const matched = personas.find(p => p.id === pId);
+    if (matched) {
+      setCustomSystemPrompt(matched.system_prompt);
+      setCustomGreeting(matched.greeting);
+    }
+  };
+
+  // =========================================================================
+  // 3. REACTIVE WAVEFORM VISUALIZER (Canvas 2D)
+  // =========================================================================
   useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    let phaseAngle = 0;
+
+    const renderWave = () => {
+      const width = canvas.width;
+      const height = canvas.height;
+      const centerY = height / 2;
+      ctx.clearRect(0, 0, width, height);
+
+      const currentPhase = vaPhaseRef.current;
+      const analyser = vaAnalyserRef.current;
+
+      if (currentPhase === 'listening' && analyser) {
+        // Real-time microphone frequency & time-domain wave
+        const bufferLength = analyser.fftSize;
+        const dataArray = new Uint8Array(bufferLength);
+        analyser.getByteTimeDomainData(dataArray);
+
+        ctx.lineWidth = 3;
+        const gradient = ctx.createLinearGradient(0, 0, width, 0);
+        gradient.addColorStop(0, '#06b6d4');
+        gradient.addColorStop(0.5, '#10b981');
+        gradient.addColorStop(1, '#3b82f6');
+        ctx.strokeStyle = gradient;
+        ctx.beginPath();
+
+        const sliceWidth = (width * 1.0) / bufferLength;
+        let x = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const v = dataArray[i] / 128.0;
+          const y = v * (height / 2);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+          x += sliceWidth;
+        }
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = '#06b6d4';
+
+      } else if (currentPhase === 'processing') {
+        // Golden pulsating sine wave during server processing
+        phaseAngle += 0.08;
+        ctx.lineWidth = 3.5;
+        const gradient = ctx.createLinearGradient(0, 0, width, 0);
+        gradient.addColorStop(0, '#f59e0b');
+        gradient.addColorStop(0.5, '#fbbf24');
+        gradient.addColorStop(1, '#d97706');
+        ctx.strokeStyle = gradient;
+        ctx.shadowBlur = 16;
+        ctx.shadowColor = '#f59e0b';
+        ctx.beginPath();
+
+        for (let x = 0; x < width; x++) {
+          const frequency = 0.03;
+          const amplitude = Math.sin(phaseAngle * 1.5) * 18 + 22;
+          const y = centerY + Math.sin(x * frequency + phaseAngle) * amplitude;
+          if (x === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+      } else if (currentPhase === 'speaking' || currentPhase === 'greeting') {
+        // Active frequency spectrum of the assistant's speech
+        phaseAngle += 0.12;
+        ctx.lineWidth = 3;
+        const gradient = ctx.createLinearGradient(0, 0, width, 0);
+        gradient.addColorStop(0, '#a855f7');
+        gradient.addColorStop(0.5, '#ec4899');
+        gradient.addColorStop(1, '#6366f1');
+        ctx.strokeStyle = gradient;
+        ctx.shadowBlur = 14;
+        ctx.shadowColor = '#ec4899';
+        ctx.beginPath();
+
+        for (let x = 0; x < width; x++) {
+          const y = centerY + Math.sin(x * 0.04 + phaseAngle) * 20 * Math.sin((x / width) * Math.PI);
+          if (x === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+      } else {
+        // STANDBY
+        phaseAngle += 0.02;
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
+        ctx.shadowBlur = 4;
+        ctx.shadowColor = 'rgba(148, 163, 184, 0.3)';
+        ctx.beginPath();
+        for (let x = 0; x < width; x++) {
+          const y = centerY + Math.sin(x * 0.02 + phaseAngle) * 2;
+          if (x === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+
+      ctx.shadowBlur = 0;
+      animFrameIdRef.current = requestAnimationFrame(renderWave);
+    };
+
+    renderWave();
     return () => {
-      if (vaSilenceTimerRef.current) clearInterval(vaSilenceTimerRef.current);
-      if (vaStreamRef.current) vaStreamRef.current.getTracks().forEach((t) => t.stop());
-      if (vaAudioCtxRef.current && vaAudioCtxRef.current.state === 'running') vaAudioCtxRef.current.close();
+      if (animFrameIdRef.current) cancelAnimationFrame(animFrameIdRef.current);
     };
   }, []);
 
-  // ==========================================
-  // 1. BENCHMARK LOGIC
-  // ==========================================
+  // =========================================================================
+  // 2. AUDIO & VAD SETUP
+  // =========================================================================
+  const setupAudioContextAndAnalyser = (stream) => {
+    if (!vaAudioCtxRef.current) {
+      vaAudioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const ctx = vaAudioCtxRef.current;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.8;
+    source.connect(analyser);
+    vaAnalyserRef.current = analyser;
+  };
+
+  const triggerClientBargeIn = () => {
+    if (!vaCallActiveRef.current) return;
+    const currentP = vaPhaseRef.current;
+    if (currentP === 'speaking' || currentP === 'greeting' || currentP === 'processing') {
+      console.log("⚡ Zero-Latency Barge-In Triggered by User Speech");
+      setBargeInOccurred(true);
+      setTimeout(() => setBargeInOccurred(false), 2500);
+
+      // 1. Immediately pause and reset playback
+      if (vaLiveAudioRef.current) {
+        vaLiveAudioRef.current.pause();
+        vaLiveAudioRef.current.currentTime = 0;
+      }
+      if (vaGreetAudioRef.current) {
+        vaGreetAudioRef.current.pause();
+        vaGreetAudioRef.current.currentTime = 0;
+      }
+
+      // 2. Abort any in-flight fetch request
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+
+      // 3. Notify backend asynchronously
+      if (vaSessionIdRef.current) {
+        const fd = new FormData();
+        fd.append('session_id', vaSessionIdRef.current);
+        fetch('/api/voice-assistant/barge-in', { method: 'POST', body: fd }).catch(e => console.log("Barge-in sync:", e));
+      }
+
+      // 4. Immediately switch back to listening
+      startListening();
+    }
+  };
+
+  const startSilenceAndBargeInMonitor = () => {
+    stopSilenceMonitor();
+    vaSilenceStartRef.current = null;
+
+    vaSilenceTimerRef.current = setInterval(() => {
+      const analyser = vaAnalyserRef.current;
+      if (!analyser) return;
+
+      const buf = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / buf.length);
+
+      const currentPhase = vaPhaseRef.current;
+
+      // Barge-in check: If user speaks over assistant audio (debounce first 500ms of playback)
+      const playbackAge = Date.now() - vaPlaybackStartTimeRef.current;
+      if ((currentPhase === 'speaking' || currentPhase === 'greeting') && playbackAge > 500 && rms > 0.065) {
+        triggerClientBargeIn();
+        return;
+      }
+
+      // Turn submission check: If in listening phase and silence detected
+      if (currentPhase === 'listening') {
+        if (rms < 0.02) {
+          if (vaSilenceStartRef.current === null) {
+            vaSilenceStartRef.current = Date.now();
+          } else if (Date.now() - vaSilenceStartRef.current >= (vadThresholdSeconds * 1000)) {
+            stopAndSubmitTurn();
+          }
+        } else {
+          vaSilenceStartRef.current = null;
+        }
+      }
+    }, 150);
+  };
+
+  const stopSilenceMonitor = () => {
+    if (vaSilenceTimerRef.current) {
+      clearInterval(vaSilenceTimerRef.current);
+      vaSilenceTimerRef.current = null;
+    }
+  };
+
+  const stopMicTracks = () => {
+    if (vaStreamRef.current) {
+      vaStreamRef.current.getTracks().forEach((t) => t.stop());
+      vaStreamRef.current = null;
+    }
+  };
+
+  // =========================================================================
+  // 1. VOICE CALL FLOW (Hands-Free Loop)
+  // =========================================================================
+  const startCall = async () => {
+    setError(null);
+    setLatestFeedbackReport(null);
+    setVaGreeting('');
+    setVaTurns([]);
+    setVaSessionId(null);
+    vaSessionIdRef.current = null;
+
+    try {
+      if (!vaStreamRef.current) {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+            sampleRate: 16000
+          }
+        });
+        vaStreamRef.current = stream;
+        setupAudioContextAndAnalyser(stream);
+      }
+      setVaCallActive(true);
+      vaCallActiveRef.current = true;
+      startGreeting();
+    } catch (err) {
+      console.error(err);
+      setError("Microphone access denied or audio device not available.");
+    }
+  };
+
+  const startGreeting = async () => {
+    updateVaPhase('greeting');
+    setVaTurns([]);
+    try {
+      const formData = new FormData();
+      formData.append('persona_id', selectedPersonaId);
+      formData.append('tts_engine', ttsEngine);
+      if (customGreeting.trim()) formData.append('custom_greeting', customGreeting.trim());
+
+      const res = await fetch('/api/voice-assistant/greet', { method: 'POST', body: formData });
+      if (!res.ok) {
+        const ed = await res.json();
+        throw new Error(ed.detail || 'Greeting failed.');
+      }
+      const data = await res.json();
+      setVaGreeting(data.text);
+      vaPlaybackStartTimeRef.current = Date.now();
+      startSilenceAndBargeInMonitor();
+
+      const el = vaGreetAudioRef.current;
+      if (el && data.audio_url) {
+        el.src = data.audio_url;
+        el.play().catch((e) => {
+          console.log("Autoplay check:", e);
+          startListening();
+        });
+      } else {
+        startListening();
+      }
+    } catch (err) {
+      setError(err.message);
+      setVaCallActive(false);
+      vaCallActiveRef.current = false;
+      updateVaPhase('idle');
+      stopMicTracks();
+    }
+  };
+
+  const startListening = () => {
+    if (!vaCallActiveRef.current || !vaStreamRef.current) return;
+    vaAudioChunksRef.current = [];
+
+    try {
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+      const recorder = new MediaRecorder(vaStreamRef.current, { mimeType });
+      vaMediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) vaAudioChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(vaAudioChunksRef.current, { type: mimeType });
+        vaAudioChunksRef.current = [];
+        if (vaCallActiveRef.current && blob.size > 100) {
+          submitTurn(blob);
+        } else if (vaCallActiveRef.current) {
+          startListening();
+        }
+      };
+
+      recorder.start(200); // 200ms slice chunks
+      updateVaPhase('listening');
+      setVaTimer(0);
+      if (vaTimerRef.current) clearInterval(vaTimerRef.current);
+      vaTimerRef.current = setInterval(() => setVaTimer(prev => prev + 1), 1000);
+      startSilenceAndBargeInMonitor();
+    } catch (err) {
+      console.error(err);
+      setError("Could not initialize microphone recorder.");
+    }
+  };
+
+  const stopAndSubmitTurn = () => {
+    stopSilenceMonitor();
+    if (vaTimerRef.current) clearInterval(vaTimerRef.current);
+    const recorder = vaMediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      updateVaPhase('processing');
+      recorder.stop();
+    }
+  };
+
+  const submitTurn = async (blob) => {
+    if (!vaCallActiveRef.current) return;
+    updateVaPhase('processing');
+    console.log(`[Voice Assistant] Submitting voice turn: ${blob.size} bytes`);
+
+    const formData = new FormData();
+    formData.append('audio', blob, `turn_${Date.now()}.webm`);
+    formData.append('stt_model', sttModel);
+    formData.append('persona_id', selectedPersonaId);
+    formData.append('tts_engine', ttsEngine);
+    if (customSystemPrompt.trim()) formData.append('custom_system_prompt', customSystemPrompt.trim());
+    if (vaSessionIdRef.current) formData.append('session_id', vaSessionIdRef.current);
+
+    abortControllerRef.current = new AbortController();
+
+    try {
+      const response = await fetch('/api/voice-assistant/interact', {
+        method: 'POST',
+        body: formData,
+        signal: abortControllerRef.current.signal
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Voice turn processing failed.');
+      }
+
+      const data = await response.json();
+      vaSessionIdRef.current = data.session_id;
+      setVaSessionId(data.session_id);
+      if (data.telemetry) setVaTelemetry(data.telemetry);
+
+      const newTurn = {
+        id: data.id,
+        user_transcript: data.user_transcript,
+        llm_response: data.llm_response,
+        audio_url: data.audio_url,
+        latency: data.latency,
+        tts_engine_used: data.tts_engine_used,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      };
+
+      setVaTurns(prev => [...prev, newTurn]);
+      updateVaPhase('speaking');
+      vaPlaybackStartTimeRef.current = Date.now();
+
+      // Play audio response with barge-in active
+      const el = vaLiveAudioRef.current;
+      if (el && data.audio_url) {
+        el.src = data.audio_url;
+        el.play().catch(e => console.log("Playback interrupted or blocked:", e));
+      }
+      startSilenceAndBargeInMonitor();
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        console.log("Turn request aborted by barge-in.");
+      } else {
+        setError(err.message);
+        if (vaCallActiveRef.current) startListening();
+      }
+    }
+  };
+
+  const handleLiveAudioEnded = () => {
+    if (vaCallActiveRef.current && vaPhaseRef.current === 'speaking') {
+      setTimeout(() => startListening(), 300);
+    }
+  };
+
+  const handleGreetAudioEnded = () => {
+    if (vaCallActiveRef.current && vaPhaseRef.current === 'greeting') {
+      startListening();
+    }
+  };
+
+  const endCall = async () => {
+    stopSilenceMonitor();
+    if (vaTimerRef.current) clearInterval(vaTimerRef.current);
+    const recorder = vaMediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+
+    vaCallActiveRef.current = false;
+    setVaCallActive(false);
+    updateVaPhase('idle');
+    stopMicTracks();
+
+    await finalizeSession();
+  };
+
+  const finalizeSession = async () => {
+    if (!vaSessionIdRef.current) return;
+    try {
+      const formData = new FormData();
+      formData.append('session_id', vaSessionIdRef.current);
+      const res = await fetch('/api/voice-assistant/finalize', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.detail || 'Finalize report compilation failed.');
+      }
+      const data = await res.json();
+      setLatestFeedbackReport(data.structured_feedback);
+      fetchAnalytics();
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  // =========================================================================
+  // 7. GROUND-TRUTH ACCURACY BENCHMARK & LEVENSHTEIN ENGINE (WER / CER)
+  // =========================================================================
   const toggleModelSelection = (id) => {
-    setSelectedModels(prev => 
-      prev.includes(id) 
-        ? prev.length > 1 ? prev.filter(m => m !== id) : prev 
+    setSelectedModels(prev =>
+      prev.includes(id)
+        ? prev.length > 1 ? prev.filter(m => m !== id) : prev
         : [...prev, id]
     );
   };
@@ -138,7 +640,7 @@ export default function App() {
         const blob = new Blob(bmAudioChunksRef.current, { type: mimeType });
         setBmAudioBlob(blob);
         setBmAudioUrl(URL.createObjectURL(blob));
-        setBmAudioName(`mic_bm_${new Date().toISOString().slice(11, 19).replace(/:/g, '-')}.webm`);
+        setBmAudioName(`benchmark_${new Date().toISOString().slice(11, 19).replace(/:/g, '-')}.webm`);
       };
 
       bmMediaRecorderRef.current.start();
@@ -182,7 +684,7 @@ export default function App() {
 
   const runBenchmark = async () => {
     if (!bmAudioBlob) {
-      setError("No audio recording or file selected.");
+      setError("No audio recording or file selected for benchmarking.");
       return;
     }
     if (selectedModels.length === 0) {
@@ -196,6 +698,7 @@ export default function App() {
     const formData = new FormData();
     formData.append('audio', bmAudioBlob, bmAudioName || 'recording.webm');
     formData.append('models', selectedModels.join(','));
+    if (bmReferenceText.trim()) formData.append('reference_text', bmReferenceText.trim());
 
     try {
       const response = await fetch('/api/benchmark', {
@@ -217,265 +720,38 @@ export default function App() {
     }
   };
 
-  // ==========================================
-  // 2. VOICE ASSISTANT LOGIC (STT -> LLM -> TTS)
-  // ==========================================
-
-  // ==========================================
-  // 3. CONTINUOUS CALL LOOP (hands-free)
-  // ==========================================
-  const playResponseAudio = (dataUrl) => {
-    const el = vaLiveAudioRef.current;
-    if (el && dataUrl) {
-      el.src = dataUrl;
-      el.play().catch((e) => console.log("Autoplay prevented by browser:", e));
-    }
-  };
-
-  const stopSilenceMonitor = () => {
-    if (vaSilenceTimerRef.current) {
-      clearInterval(vaSilenceTimerRef.current);
-      vaSilenceTimerRef.current = null;
-    }
-  };
-
-  const stopMicTracks = () => {
-    if (vaStreamRef.current) {
-      vaStreamRef.current.getTracks().forEach((t) => t.stop());
-      vaStreamRef.current = null;
-    }
-  };
-
-  const setupAnalyser = (stream) => {
-    if (!vaAudioCtxRef.current) {
-      vaAudioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    const ctx = vaAudioCtxRef.current;
-    if (ctx.state === 'suspended') ctx.resume();
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 1024;
-    analyser.smoothingTimeConstant = 0.8;
-    source.connect(analyser);
-    vaAnalyserRef.current = analyser;
-  };
-
-  const startCall = async () => {
-    setError(null);
-    setStructuredFeedback(null);
-    setVaGreeting('');
-    setVaTurns([]);
-    setVaSessionId(null);
-    vaSessionIdRef.current = null;
-    try {
-      if (!vaStreamRef.current) {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        vaStreamRef.current = stream;
-        setupAnalyser(stream);
-      }
-      setVaCallActive(true);
-      startGreeting();
-    } catch (err) {
-      console.error(err);
-      setError("Microphone access denied or audio device not found.");
-    }
-  };
-
-  const startGreeting = async () => {
-    setVaPhase('greeting');
-    setVaTurns([]);
-    try {
-      const res = await fetch('/api/voice-assistant/greet', { method: 'POST' });
-      if (!res.ok) {
-        const ed = await res.json();
-        throw new Error(ed.detail || 'Greeting failed.');
-      }
-      const data = await res.json();
-      setVaGreeting(data.text);
-      const el = vaGreetAudioRef.current;
-      if (el && data.audio_url) {
-        el.src = data.audio_url;
-        el.play().catch((e) => console.log("Greeting autoplay blocked:", e));
-      } else {
-        startListening();
-      }
-    } catch (err) {
-      setError(err.message);
-      setVaCallActive(false);
-      setVaPhase('idle');
-      stopMicTracks();
-    }
-  };
-
-  const startListening = () => {
-    if (!vaCallActiveRef.current || !vaStreamRef.current) return;
-    vaAudioChunksRef.current = [];
-    try {
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
-      const recorder = new MediaRecorder(vaStreamRef.current, { mimeType });
-      vaMediaRecorderRef.current = recorder;
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) vaAudioChunksRef.current.push(e.data);
-      };
-      recorder.onstop = () => {
-        const blob = new Blob(vaAudioChunksRef.current, { type: mimeType });
-        vaAudioChunksRef.current = [];
-        if (vaCallActiveRef.current) submitTurn(blob);
-      };
-      recorder.start();
-      setVaPhase('listening');
-      setVaTimer(0);
-      vaTimerRef.current = setInterval(() => setVaTimer((prev) => prev + 1), 1000);
-      startSilenceMonitor();
-    } catch (err) {
-      console.error(err);
-      setError("Could not start recording.");
-    }
-  };
-
-  const startSilenceMonitor = () => {
-    stopSilenceMonitor();
-    vaSilenceStartRef.current = null;
-    vaSilenceTimerRef.current = setInterval(() => {
-      const analyser = vaAnalyserRef.current;
-      if (!analyser) return;
-      const buf = new Uint8Array(analyser.fftSize);
-      analyser.getByteTimeDomainData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) {
-        const v = (buf[i] - 128) / 128;
-        sum += v * v;
-      }
-      const rms = Math.sqrt(sum / buf.length);
-      if (rms < 0.02) {
-        if (vaSilenceStartRef.current === null) {
-          vaSilenceStartRef.current = Date.now();
-        } else if (Date.now() - vaSilenceStartRef.current >= 1500) {
-          stopAndSubmitTurn();
-        }
-      } else {
-        vaSilenceStartRef.current = null;
-      }
-    }, 250);
-  };
-
-  const stopAndSubmitTurn = () => {
-    stopSilenceMonitor();
-    clearInterval(vaTimerRef.current);
-    const recorder = vaMediaRecorderRef.current;
-    if (recorder && recorder.state !== 'inactive') {
-      setVaPhase('processing');
-      recorder.stop();
-    }
-  };
-
-  const submitTurn = async (blob) => {
-    if (!vaCallActiveRef.current) return;
-    setVaPhase('processing');
-    const formData = new FormData();
-    formData.append('audio', blob, `turn_${Date.now()}.webm`);
-    formData.append('stt_model', sttModel);
-    if (vaSessionIdRef.current) formData.append('session_id', vaSessionIdRef.current);
-
-    try {
-      const response = await fetch('/api/voice-assistant/interact', {
-        method: 'POST',
-        body: formData,
-      });
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Voice turn processing failed.');
-      }
-      const data = await response.json();
-      vaSessionIdRef.current = data.session_id;
-      setVaSessionId(data.session_id);
-      if (data.telemetry) setVaTelemetry(data.telemetry);
-
-      const newTurn = {
-        id: data.id,
-        user_transcript: data.user_transcript,
-        llm_response: data.llm_response,
-        audio_url: data.audio_url,
-        latency: data.latency,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      };
-      setVaTurns((prev) => [...prev, newTurn]);
-      setVaPhase('speaking');
-      playResponseAudio(data.audio_url);
-    } catch (err) {
-      setError(err.message);
-      if (vaCallActiveRef.current) startListening();
-    }
-  };
-
-  const handleLiveAudioEnded = () => {
-    if (vaCallActiveRef.current && vaPhaseRef.current === 'speaking') {
-      setTimeout(() => startListening(), 400);
-    }
-  };
-
-  const handleGreetAudioEnded = () => {
-    if (vaCallActiveRef.current) startListening();
-  };
-
-  const endCall = async () => {
-    stopSilenceMonitor();
-    clearInterval(vaTimerRef.current);
-    const recorder = vaMediaRecorderRef.current;
-    if (recorder && recorder.state !== 'inactive') recorder.stop();
-    vaCallActiveRef.current = false;
-    setVaCallActive(false);
-    setVaPhase('speaking');
-    stopMicTracks();
-    await finalizeSession();
-  };
-
-  const finalizeSession = async () => {
-    if (!vaSessionIdRef.current) {
-      setError("No active conversation to finalize.");
-      return;
-    }
-    try {
-      const formData = new FormData();
-      formData.append('session_id', vaSessionIdRef.current);
-      const res = await fetch('/api/voice-assistant/finalize', {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.detail || 'Finalize failed.');
-      }
-      const data = await res.json();
-      setStructuredFeedback(data.structured_feedback);
-    } catch (err) {
-      setError(err.message);
-    }
-  };
-
   return (
     <div className="app-container">
-      {/* Header Section */}
+      {/* Top Header */}
       <header className="header-section">
-        <span className="header-badge">Vaani AI • Real-Time Voice Intelligence</span>
-        <h1 className="app-title">Vaani AI</h1>
+        <div className="header-badge-row">
+          <span className="header-badge">✨ Multi-Domain Voice Intelligence Studio</span>
+          <span className="header-badge-sub">Sub-Second Conversational Pipeline</span>
+        </div>
+        <h1 className="app-title">Vaani AI Studio</h1>
         <p className="app-subtitle">
-          Real-time Hindi & Hinglish conversational voice AI assistant with sub-second latency, Groq LLM reasoning, and multi-model STT benchmarking.
+          Next-generation bilingual Hindi & Hinglish conversational voice assistant with zero-latency barge-in, multi-engine TTS, live slot tracking, and ground-truth WER/CER benchmarking.
         </p>
 
-        {/* Tab Selector */}
+        {/* Navigation Tabs */}
         <div className="tab-bar">
-          <button 
+          <button
             className={`tab-btn ${activeTab === 'assistant' ? 'active' : ''}`}
             onClick={() => setActiveTab('assistant')}
           >
-            🎙️ Vaani AI Voice Assistant
+            🎙️ Voice Assistant Studio
           </button>
-          <button 
+          <button
+            className={`tab-btn ${activeTab === 'analytics' ? 'active' : ''}`}
+            onClick={() => { setActiveTab('analytics'); fetchAnalytics(); }}
+          >
+            📊 Post-Call Analytics & Logs
+          </button>
+          <button
             className={`tab-btn ${activeTab === 'benchmark' ? 'active' : ''}`}
             onClick={() => setActiveTab('benchmark')}
           >
-            📊 STT Benchmark Comparison
+            📈 STT Benchmark & WER/CER
           </button>
         </div>
       </header>
@@ -487,38 +763,68 @@ export default function App() {
       )}
 
       {/* ==================================================================== */}
-      {/* TAB 1: VOICE ASSISTANT PIPELINE (MULTI-TURN + TELEMETRY) */}
+      {/* TAB 1: VOICE ASSISTANT STUDIO & LIVE CALL */}
       {/* ==================================================================== */}
       {activeTab === 'assistant' && (
         <div className="tab-content">
-          {/* Session Header Bar */}
+          {/* Top Session Bar */}
           <div className="session-bar">
             <div className="session-info">
-              <span>💬 Session Context:</span>
-              <span className="session-badge">{vaSessionId || 'New Session'}</span>
+              <span>💬 Session:</span>
+              <span className="session-badge">{vaSessionId || 'Ready'}</span>
               <span>• Turns: <strong>{vaTurns.length}</strong></span>
-              {vaCallActive && <span className="call-live-tag">🟢 Call Live</span>}
+              {vaCallActive && (
+                <span className={`call-live-tag ${vaPhase}`}>
+                  🟢 Call Active ({vaPhase.toUpperCase()})
+                </span>
+              )}
+              {bargeInOccurred && (
+                <span className="barge-in-badge">⚡ Interrupted by Barge-In</span>
+              )}
             </div>
             {vaCallActive && (
               <button className="btn-reset-session end-call-btn" onClick={endCall}>
-                🔴 End Call
+                🔴 End Call & Finalize
               </button>
             )}
           </div>
 
-          {/* Controls & Engine Selection */}
-          <div className="card">
+          {/* Persona Studio & Pipeline Configuration Card */}
+          <div className="card persona-studio-card">
             <div className="section-header">
               <div className="section-title">
-                <span>⚡</span> Pipeline Engine Settings
+                <span>🎭</span> Multi-Domain Persona Studio & Pipeline Configuration
               </div>
-              <span className="section-hint">STT Model + Groq LLM + Edge-TTS</span>
+              <button
+                className="btn-toggle-editor"
+                onClick={() => setShowPromptEditor(!showPromptEditor)}
+              >
+                {showPromptEditor ? '▲ Hide Directives' : '✏️ Tune Runtime Directives'}
+              </button>
             </div>
 
             <div className="assistant-settings-grid">
+              {/* Persona Selector */}
+              <div className="setting-box">
+                <label className="setting-label">Active Persona Preset</label>
+                <select
+                  className="setting-select"
+                  value={selectedPersonaId}
+                  onChange={handlePersonaChange}
+                  disabled={vaCallActive}
+                >
+                  {personas.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* STT Model Selector */}
               <div className="setting-box">
                 <label className="setting-label">Speech Recognition (STT)</label>
-                <select 
+                <select
                   className="setting-select"
                   value={sttModel}
                   onChange={(e) => setSttModel(e.target.value)}
@@ -526,147 +832,208 @@ export default function App() {
                 >
                   {models.map(m => (
                     <option key={m.id} value={m.id}>
-                      {m.name} {m.id === 'groq-whisper-large-v3-turbo' ? '☁️ (Cloud GPU)' : m.id === 'indic-conformer-onnx' ? '⚡ (Sub-200ms CPU)' : ''}
+                      {m.name} {m.id === 'indic-conformer-onnx' ? '⚡ (<200ms)' : m.id === 'groq-whisper-large-v3-turbo' ? '☁️ (Cloud GPU)' : ''}
                     </option>
                   ))}
                 </select>
               </div>
 
+              {/* TTS Multi-Engine Selector */}
               <div className="setting-box">
-                <label className="setting-label">LLM Engine (Reasoning)</label>
-                <div className="static-badge-box">
-                  🤖 <strong>Groq openai/gpt-oss-20b</strong> <span className="speed-tag">Multi-Turn Context</span>
-                </div>
+                <label className="setting-label">TTS Synthesis Engine</label>
+                <select
+                  className="setting-select"
+                  value={ttsEngine}
+                  onChange={(e) => setTtsEngine(e.target.value)}
+                  disabled={vaCallActive}
+                >
+                  {ttsEngines.map(eng => (
+                    <option key={eng.id} value={eng.id} disabled={!eng.available}>
+                      {eng.name} {eng.is_offline ? '🛡️ (100% Offline)' : '⚡ (Neural Stream)'}
+                    </option>
+                  ))}
+                </select>
               </div>
 
+              {/* Tunable VAD Silence Threshold Slider */}
               <div className="setting-box">
-                <label className="setting-label">Voice Synthesis (TTS)</label>
-                <div className="static-badge-box">
-                  🔊 <strong>Edge-TTS Natural Neural Voice</strong> <span className="speed-tag">Hi-IN / En-IN</span>
+                <div className="setting-label-row">
+                  <label className="setting-label">VAD Silence Turn Threshold</label>
+                  <span className="vad-value-badge">{vadThresholdSeconds}s</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.6"
+                  max="2.5"
+                  step="0.1"
+                  className="vad-slider"
+                  value={vadThresholdSeconds}
+                  onChange={(e) => setVadThresholdSeconds(parseFloat(e.target.value))}
+                  disabled={vaCallActive}
+                />
+                <div className="vad-hints">
+                  <span>0.6s (Fast/Quiet)</span>
+                  <span>1.2s (Standard)</span>
+                  <span>2.5s (Noisy)</span>
                 </div>
               </div>
             </div>
+
+            {/* Collapsible Directive Editor */}
+            {showPromptEditor && (
+              <div className="prompt-editor-panel">
+                <div className="editor-row">
+                  <div className="editor-col">
+                    <label className="editor-label">Custom System Prompt / Directives</label>
+                    <textarea
+                      className="prompt-textarea"
+                      rows="4"
+                      value={customSystemPrompt}
+                      onChange={(e) => setCustomSystemPrompt(e.target.value)}
+                      placeholder="Customize the LLM persona guidelines..."
+                      disabled={vaCallActive}
+                    />
+                  </div>
+                  <div className="editor-col">
+                    <label className="editor-label">Persona Initial Greeting Text</label>
+                    <textarea
+                      className="prompt-textarea"
+                      rows="4"
+                      value={customGreeting}
+                      onChange={(e) => setCustomGreeting(e.target.value)}
+                      placeholder="Initial greeting spoken when starting call..."
+                      disabled={vaCallActive}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Interactive Audio Capture Card */}
-          <div className="card">
+          {/* Interactive Audio Visualizer & Call Stage */}
+          <div className="card visualizer-card">
             <div className="section-header">
               <div className="section-title">
-                <span>🎙️</span> {vaCallActive ? 'Call In Progress' : 'Voice Call'}
+                <span>🎙️</span> {vaCallActive ? 'Live Call & Audio Visualizer' : 'Voice Assistant Call Console'}
               </div>
               <span className="section-hint">
                 {vaCallActive
-                  ? '🔄 Hands-free — mic auto-starts after the AI finishes speaking'
-                  : 'Start a call to begin collecting feedback'}
+                  ? '🔄 Hands-Free VAD + Instant Barge-In Enabled'
+                  : 'Click Start Call to initiate the hands-free voice pipeline'}
               </span>
             </div>
 
-            {/* Idle — Start Call (the only button here) */}
-            {!vaCallActive && (
-              <div className="audio-capture-box">
-                <div className="btn-group">
-                  <button className="btn btn-primary btn-start-call" onClick={startCall}>
-                    <span>▶️</span> Start Call
-                  </button>
+            {/* 2D Canvas Waveform */}
+            <div className="visualizer-wrapper">
+              <canvas
+                ref={canvasRef}
+                id="va-waveform-canvas"
+                width="800"
+                height="120"
+                className={`waveform-canvas ${vaPhase}`}
+              />
+              <div className="visualizer-status-pill">
+                {vaPhase === 'idle' && '⚪ Standby (Microphone Idle)'}
+                {vaPhase === 'greeting' && '👋 Assistant Greeting'}
+                {vaPhase === 'listening' && `🎙️ Listening... (VAD commit ${vadThresholdSeconds}s)`}
+                {vaPhase === 'processing' && '⚡ Reasoning & Synthesizing Response...'}
+                {vaPhase === 'speaking' && '🔊 Assistant Speaking (Speak anytime to barge-in)'}
+              </div>
+            </div>
+
+            {/* Start Call Button & Phase Indicators */}
+            {!vaCallActive ? (
+              <div className="call-action-box">
+                <button className="btn btn-primary btn-start-call" onClick={startCall}>
+                  <span>▶️</span> Start Voice Call
+                </button>
+              </div>
+            ) : (
+              <div className="active-call-controls">
+                <div className="active-timer">
+                  <span>⏱️ Call Duration:</span> <strong>{formatTime(vaTimer)}</strong>
                 </div>
+                <button className="btn btn-discard" onClick={endCall}>
+                  🔴 End Call
+                </button>
               </div>
             )}
 
-            {/* Greeting phase */}
-            {vaCallActive && vaPhase === 'greeting' && (
-              <div className="status-box">
-                <div className="mic-circle speaking">👋</div>
-                <p className="status-text">{vaGreeting || 'Greeting...'}</p>
-                <audio ref={vaGreetAudioRef} onEnded={handleGreetAudioEnded} style={{ display: 'none' }} />
-              </div>
-            )}
-
-            {/* Listening phase — user is speaking */}
-            {vaCallActive && vaPhase === 'listening' && (
-              <div className="audio-capture-box">
-                <div className="mic-circle recording">⏺️</div>
-                <div className="recording-timer">{formatTime(vaTimer)}</div>
-                <div className="listening-hint">🗣️ Listening… speak now — turn auto-submits after 1.5s of silence</div>
-              </div>
-            )}
-
-            {/* Processing / Speaking phases */}
-            {(vaCallActive && (vaPhase === 'processing' || vaPhase === 'speaking')) && (
-              <div className="status-box">
-                <div className={vaPhase === 'processing' ? 'cs-spinner' : 'mic-circle speaking'}>
-                  {vaPhase === 'processing' ? '⚙️' : '🔊'}
-                </div>
-                <p className="status-text">
-                  {vaPhase === 'processing'
-                    ? 'Processing turn (STT → LLM → TTS)…'
-                    : 'Assistant speaking… mic will auto-start after.'}
-                </p>
-                <audio ref={vaLiveAudioRef} onEnded={handleLiveAudioEnded} style={{ display: 'none' }} />
-              </div>
-            )}
+            {/* Hidden Audio Elements for Playback */}
+            <audio ref={vaGreetAudioRef} onEnded={handleGreetAudioEnded} style={{ display: 'none' }} />
+            <audio ref={vaLiveAudioRef} onEnded={handleLiveAudioEnded} style={{ display: 'none' }} />
           </div>
 
-          {/* Real-Time Sentiment & Telemetry Dashboard */}
-          {vaTurns.length > 0 && (
+          {/* Memory Slots & Real-Time Telemetry Dashboard */}
+          {(vaTurns.length > 0 || (vaTelemetry.slots && Object.keys(vaTelemetry.slots).length > 0)) && (
             <div className="telemetry-card">
               <div className="section-header">
                 <div className="section-title">
-                  <span>📊</span> Real-Time Session Telemetry & Sentiment Dashboard
+                  <span>🧠</span> Active Memory Slots & Real-Time Telemetry
                 </div>
-                <span className="section-hint">Post-Call Telemetry Extraction</span>
+                <span className="section-hint">Persisted State Across Turns</span>
               </div>
 
+              {/* Telemetry Metrics Row */}
               <div className="telemetry-grid">
                 <div className="telemetry-item">
-                  <span className="telemetry-label">Detected Sentiment</span>
+                  <span className="telemetry-label">Customer Sentiment</span>
                   <div className={`sentiment-badge ${vaTelemetry.sentiment}`}>
                     {vaTelemetry.sentiment === 'positive' && '🟢 Positive'}
                     {vaTelemetry.sentiment === 'neutral' && '🟡 Neutral'}
-                    {vaTelemetry.sentiment === 'frustrated' && '🔴 Frustrated Customer'}
+                    {vaTelemetry.sentiment === 'negative' && '🔴 Negative'}
+                    {vaTelemetry.sentiment === 'frustrated' && '🔥 Frustrated'}
                   </div>
                 </div>
 
                 <div className="telemetry-item">
                   <span className="telemetry-label">Estimated CSAT Rating</span>
                   <div className="csat-stars">
-                    {'★'.repeat(vaTelemetry.csat_estimate)}{'☆'.repeat(5 - vaTelemetry.csat_estimate)}
-                    <span style={{ fontSize: '0.85rem', color: '#94a3b8', marginLeft: '0.5rem' }}>
-                      ({vaTelemetry.csat_estimate}/5)
-                    </span>
+                    {'★'.repeat(vaTelemetry.csat_estimate || 3)}{'☆'.repeat(5 - (vaTelemetry.csat_estimate || 3))}
+                    <span className="csat-number">({vaTelemetry.csat_estimate || 3}/5)</span>
                   </div>
                 </div>
 
                 <div className="telemetry-item">
-                  <span className="telemetry-label">Detected Customer Intent</span>
+                  <span className="telemetry-label">Detected Intent</span>
                   <div className="intent-tag">
-                    🏷️ {vaTelemetry.detected_intent}
+                    🏷️ {vaTelemetry.detected_intent || 'General Inquiry'}
                   </div>
                 </div>
 
                 <div className="telemetry-item">
-                  <span className="telemetry-label">Human Escalation Status</span>
-                  <div style={{ fontSize: '0.9rem', fontWeight: '700', color: vaTelemetry.human_escalation_flag ? '#f87171' : '#34d399' }}>
+                  <span className="telemetry-label">Escalation Status</span>
+                  <div className={`escalation-pill ${vaTelemetry.human_escalation_flag ? 'escalated' : 'normal'}`}>
                     {vaTelemetry.human_escalation_flag ? '⚠️ Escalation Flagged' : '✅ Handled by Voice AI'}
                   </div>
                 </div>
               </div>
 
-              {vaTelemetry.human_escalation_flag && (
-                <div className="escalation-banner">
-                  <span>⚠️</span> <strong>Escalation Warning:</strong> High frustration or explicit human agent request detected. Flagged for Razorpay Support CRM routing.
+              {/* Entity Memory Slots Grid */}
+              {vaTelemetry.slots && Object.keys(vaTelemetry.slots).length > 0 && (
+                <div className="slots-container">
+                  <span className="slots-header-title">Extracted Domain Memory Slots:</span>
+                  <div className="slots-tags-list">
+                    {Object.entries(vaTelemetry.slots).map(([slotKey, slotVal]) => (
+                      <div className="slot-chip" key={slotKey}>
+                        <span className="slot-key">{slotKey}:</span>
+                        <span className="slot-val">{String(slotVal)}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* Full-Conversation Chat Transcript */}
+          {/* Conversation Chat Transcript */}
           {(vaTurns.length > 0 || vaGreeting) && (
             <div className="card chat-card">
               <div className="section-header">
                 <div className="section-title">
-                  <span>💬</span> Conversation
+                  <span>💬</span> Conversational Transcript
                 </div>
-                <span className="section-hint">Full call transcript in chat form</span>
+                <span className="section-hint">Multi-turn history with latency breakdown</span>
               </div>
 
               <div className="chat-container" ref={chatRef}>
@@ -674,7 +1041,7 @@ export default function App() {
                   <div className="chat-msg assistant">
                     <div className="chat-bubble">
                       <div className="chat-meta">
-                        <span className="chat-name">Vaani</span>
+                        <span className="chat-name">Assistant ({selectedPersonaId})</span>
                       </div>
                       <div className="chat-text">{vaGreeting}</div>
                     </div>
@@ -683,15 +1050,15 @@ export default function App() {
 
                 {vaTurns.map((turn, idx) => (
                   <div className="chat-turn" key={turn.id || idx}>
-                    {/* User */}
+                    {/* User message */}
                     <div className="chat-msg user">
                       <div className="chat-bubble">
                         <div className="chat-meta">
-                          <span className="chat-name">You</span>
+                          <span className="chat-name">User</span>
                           <span className="chat-time">{turn.timestamp}</span>
                         </div>
                         <div className="chat-text devanagari-text">
-                          {turn.user_transcript.devanagari || turn.user_transcript.raw || '(No speech recognized)'}
+                          {turn.user_transcript.devanagari || turn.user_transcript.raw}
                         </div>
                         {turn.user_transcript.romanised && (
                           <div className="chat-sub">🔤 {turn.user_transcript.romanised}</div>
@@ -701,17 +1068,19 @@ export default function App() {
                         )}
                         {turn.latency && (
                           <div className="chat-latency">
-                            ⚡ {turn.latency.total_seconds}s total (STT {turn.latency.stt_seconds}s · LLM {turn.latency.llm_seconds}s · TTS {turn.latency.tts_seconds}s)
+                            ⚡ {turn.latency.total_seconds}s total (STT {turn.latency.stt_seconds}s · LLM {turn.latency.llm_seconds}s · TTS {turn.latency.tts_seconds}s [{turn.tts_engine_used || 'edge-tts'}])
                           </div>
                         )}
                       </div>
                     </div>
 
-                    {/* Assistant */}
+                    {/* Assistant message */}
                     <div className="chat-msg assistant">
                       <div className="chat-bubble">
                         <div className="chat-meta">
-                          <span className="chat-name">Vaani <span className="chat-model">({turn.llm_response.model_used})</span></span>
+                          <span className="chat-name">
+                            Assistant <span className="chat-model">({turn.llm_response.model_used})</span>
+                          </span>
                           <span className="chat-time">{turn.timestamp}</span>
                         </div>
                         <div className="chat-text">"{turn.llm_response.text}"</div>
@@ -728,86 +1097,43 @@ export default function App() {
             </div>
           )}
 
-          {/* Post-Call Feedback Report (Phase 2) */}
-          {structuredFeedback && (
+          {/* Post-Call Report Preview if finalized */}
+          {latestFeedbackReport && (
             <div className="report-card">
               <div className="section-header">
                 <div className="section-title">
-                  <span>📋</span> Post-Call Feedback Report
+                  <span>📋</span> Post-Call Analysis Summary
                 </div>
                 <span className="report-saved-hint">
-                  💾 Saved: backend/post-call-analysis/{structuredFeedback.record_id || ''}_feedback.json
+                  💾 Saved to: backend/post-call-analysis/{latestFeedbackReport.record_id || ''}_feedback.json
                 </span>
               </div>
 
               <div className="report-grid">
                 <div className="report-item">
-                  <span className="report-label">Overall Sentiment</span>
-                  <div className={`sentiment-badge ${structuredFeedback.aggregate_sentiment || 'neutral'}`}>
-                    {structuredFeedback.aggregate_sentiment || 'neutral'}
+                  <span className="report-label">Aggregate Sentiment</span>
+                  <div className={`sentiment-badge ${latestFeedbackReport.aggregate_sentiment || 'neutral'}`}>
+                    {latestFeedbackReport.aggregate_sentiment}
                   </div>
                 </div>
-
                 <div className="report-item">
-                  <span className="report-label">Satisfaction Rating</span>
+                  <span className="report-label">Overall CSAT</span>
                   <div className="csat-stars">
-                    {'★'.repeat(structuredFeedback.overall_satisfaction)}{'☆'.repeat(5 - structuredFeedback.overall_satisfaction)}
-                    <span style={{ fontSize: '0.85rem', color: '#94a3b8', marginLeft: '0.5rem' }}>
-                      ({structuredFeedback.overall_satisfaction}/5)
-                    </span>
+                    {'★'.repeat(latestFeedbackReport.overall_satisfaction || 3)}{'☆'.repeat(5 - (latestFeedbackReport.overall_satisfaction || 3))}
+                    <span className="csat-number">({latestFeedbackReport.overall_satisfaction || 3}/5)</span>
                   </div>
                 </div>
-
                 <div className="report-item">
                   <span className="report-label">Resolution Status</span>
                   <div className="intent-tag">
-                    {structuredFeedback.resolution_status || 'resolved'}
-                    {structuredFeedback.follow_up_required ? ' • ⚠️ Follow-up required' : ''}
+                    {latestFeedbackReport.resolution_status || 'resolved'}
                   </div>
                 </div>
               </div>
 
-              <div className="report-columns">
-                <div className="report-column">
-                  <div className="report-col-title">⚠️ Complaints</div>
-                  <ul className="report-list">
-                    {(structuredFeedback.primary_complaints && structuredFeedback.primary_complaints.length)
-                      ? structuredFeedback.primary_complaints.map((c, i) => <li key={i}>{c}</li>)
-                      : <li className="report-empty">None recorded</li>}
-                  </ul>
-                </div>
-
-                <div className="report-column">
-                  <div className="report-col-title">✅ Positive Highlights</div>
-                  <ul className="report-list">
-                    {(structuredFeedback.positive_highlights && structuredFeedback.positive_highlights.length)
-                      ? structuredFeedback.positive_highlights.map((c, i) => <li key={i}>{c}</li>)
-                      : <li className="report-empty">None recorded</li>}
-                  </ul>
-                </div>
-
-                <div className="report-column">
-                  <div className="report-col-title">🎯 Action Items</div>
-                  <ul className="report-list">
-                    {(structuredFeedback.action_items && structuredFeedback.action_items.length)
-                      ? structuredFeedback.action_items.map((c, i) => <li key={i}>{c}</li>)
-                      : <li className="report-empty">None required</li>}
-                  </ul>
-                </div>
-              </div>
-
-              {structuredFeedback.key_topics && structuredFeedback.key_topics.length > 0 && (
-                <div className="report-topics">
-                  <span className="report-label">Key Topics:</span>{' '}
-                  {structuredFeedback.key_topics.map((t, i) => (
-                    <span className="topic-tag" key={i}>{t}</span>
-                  ))}
-                </div>
-              )}
-
               <div className="report-summary">
-                <p><strong>Summary (Hindi):</strong> {structuredFeedback.summary_hindi || '—'}</p>
-                <p><strong>Summary (English):</strong> {structuredFeedback.summary_english || '—'}</p>
+                <p><strong>Summary (Hindi/Hinglish):</strong> {latestFeedbackReport.summary_hindi || '—'}</p>
+                <p><strong>Summary (English):</strong> {latestFeedbackReport.summary_english || '—'}</p>
               </div>
             </div>
           )}
@@ -815,7 +1141,161 @@ export default function App() {
       )}
 
       {/* ==================================================================== */}
-      {/* TAB 2: STT BENCHMARK COMPARISON */}
+      {/* TAB 2: POST-CALL ANALYTICS & HISTORICAL LOGS */}
+      {/* ==================================================================== */}
+      {activeTab === 'analytics' && (
+        <div className="tab-content">
+          {/* Executive Analytics KPI Cards */}
+          <div className="analytics-kpi-grid">
+            <div className="kpi-card">
+              <span className="kpi-icon">📞</span>
+              <div className="kpi-info">
+                <span className="kpi-title">Total Completed Calls</span>
+                <span className="kpi-value">{analyticsData.total_calls}</span>
+              </div>
+            </div>
+
+            <div className="kpi-card">
+              <span className="kpi-icon">⭐</span>
+              <div className="kpi-info">
+                <span className="kpi-title">Average CSAT Score</span>
+                <span className="kpi-value">{analyticsData.average_csat} / 5.0</span>
+              </div>
+            </div>
+
+            <div className="kpi-card">
+              <span className="kpi-icon">💚</span>
+              <div className="kpi-info">
+                <span className="kpi-title">Positive Sentiment %</span>
+                <span className="kpi-value">{analyticsData.positive_sentiment_percent}%</span>
+              </div>
+            </div>
+
+            <div className="kpi-card">
+              <span className="kpi-icon">🚨</span>
+              <div className="kpi-info">
+                <span className="kpi-title">Escalations Flagged</span>
+                <span className="kpi-value">{analyticsData.escalation_count}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Historical Call Log Explorer Table */}
+          <div className="card">
+            <div className="section-header">
+              <div className="section-title">
+                <span>📑</span> Post-Call Structured Feedback Log Explorer
+              </div>
+              <button className="btn btn-secondary btn-sm" onClick={fetchAnalytics}>
+                🔄 Refresh Logs
+              </button>
+            </div>
+
+            {callLogs.length === 0 ? (
+              <div className="empty-state-box">
+                <p>No post-call records yet. Start and complete a call in the Voice Assistant tab to see generated reports here.</p>
+              </div>
+            ) : (
+              <div className="table-responsive">
+                <table className="logs-table">
+                  <thead>
+                    <tr>
+                      <th>Record ID / Time</th>
+                      <th>Persona</th>
+                      <th>Sentiment</th>
+                      <th>CSAT</th>
+                      <th>Resolution</th>
+                      <th>Extracted Slots</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {callLogs.map((log) => (
+                      <tr key={log.record_id || log.session_id}>
+                        <td>
+                          <div className="log-id">{log.record_id || log.session_id}</div>
+                          <div className="log-timestamp">{log.created_timestamp || 'Recent'}</div>
+                        </td>
+                        <td>
+                          <span className="persona-tag">{log.persona_name || log.persona_id || 'Vaani Inbound'}</span>
+                        </td>
+                        <td>
+                          <span className={`sentiment-badge ${log.aggregate_sentiment || 'neutral'}`}>
+                            {log.aggregate_sentiment || 'neutral'}
+                          </span>
+                        </td>
+                        <td>
+                          <span className="csat-stars-small">
+                            {'★'.repeat(log.overall_satisfaction || 3)}
+                          </span>
+                          <span style={{ fontSize: '0.8rem', color: '#94a3b8', marginLeft: '4px' }}>
+                            ({log.overall_satisfaction || 3}/5)
+                          </span>
+                        </td>
+                        <td>
+                          <span className={`status-pill ${log.resolution_status || 'resolved'}`}>
+                            {log.resolution_status || 'resolved'}
+                          </span>
+                        </td>
+                        <td>
+                          <div className="slots-compact">
+                            {log.extracted_slots && Object.keys(log.extracted_slots).length > 0 ? (
+                              Object.entries(log.extracted_slots).filter(([_, v]) => v).map(([k, v]) => (
+                                <span key={k} className="slot-mini-badge">{k}: {v}</span>
+                              ))
+                            ) : (
+                              <span style={{ color: '#64748b' }}>None</span>
+                            )}
+                          </div>
+                        </td>
+                        <td>
+                          <button
+                            className="btn-inspect"
+                            onClick={() => setSelectedReportModal(log)}
+                          >
+                            🔍 View JSON
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* JSON Inspector Modal */}
+          {selectedReportModal && (
+            <div className="modal-overlay" onClick={() => setSelectedReportModal(null)}>
+              <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+                <div className="modal-header">
+                  <h3>📄 Post-Call Analysis JSON Record ({selectedReportModal.record_id})</h3>
+                  <button className="modal-close-btn" onClick={() => setSelectedReportModal(null)}>✕</button>
+                </div>
+                <div className="modal-body">
+                  <pre className="json-viewer">
+                    {JSON.stringify(selectedReportModal, null, 2)}
+                  </pre>
+                </div>
+                <div className="modal-footer">
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => copyToClipboard(selectedReportModal, 'modal_json')}
+                  >
+                    {copiedKey === 'modal_json' ? '✓ Copied JSON' : '📋 Copy JSON'}
+                  </button>
+                  <button className="btn btn-primary" onClick={() => setSelectedReportModal(null)}>
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ==================================================================== */}
+      {/* TAB 3: STT BENCHMARK & WER / CER EVALUATION */}
       {/* ==================================================================== */}
       {activeTab === 'benchmark' && (
         <div className="tab-content">
@@ -823,7 +1303,7 @@ export default function App() {
           <div className="card">
             <div className="section-header">
               <div className="section-title">
-                <span>⚙️</span> Select Models to Compare
+                <span>⚙️</span> Select Models to Benchmark
               </div>
               <span className="section-hint">
                 {selectedModels.length} of {models.length} selected
@@ -834,8 +1314,8 @@ export default function App() {
               {models.map((m) => {
                 const isSelected = selectedModels.includes(m.id);
                 return (
-                  <label 
-                    key={m.id} 
+                  <label
+                    key={m.id}
                     className={`model-checkbox-card ${isSelected ? 'selected' : ''}`}
                   >
                     <div className="model-card-top">
@@ -855,13 +1335,28 @@ export default function App() {
             </div>
           </div>
 
-          {/* Audio Capture Card */}
+          {/* Ground-Truth Reference Text & Audio Capture Card */}
           <div className="card">
             <div className="section-header">
               <div className="section-title">
-                <span>🎙️</span> Benchmark Audio Input
+                <span>🎙️</span> Benchmark Audio & Ground-Truth Reference Text
               </div>
-              <span className="section-hint">Record from mic or upload audio file</span>
+              <span className="section-hint">Calculate exact WER % & CER % via Levenshtein Metric Engine</span>
+            </div>
+
+            {/* Reference Ground-Truth Textarea */}
+            <div className="reference-input-box">
+              <label className="reference-label">
+                <span>🎯 Ground-Truth Reference Transcript (Optional for WER / CER scoring):</span>
+              </label>
+              <textarea
+                className="reference-textarea"
+                rows="2"
+                placeholder="Enter exact expected Hindi or Hinglish text to measure Word Error Rate (WER) and Character Error Rate (CER)..."
+                value={bmReferenceText}
+                onChange={(e) => setBmReferenceText(e.target.value)}
+                disabled={bmLoading}
+              />
             </div>
 
             <div className="audio-capture-box">
@@ -910,7 +1405,7 @@ export default function App() {
                     <span>🎵 <strong>{bmAudioName || 'Audio Ready'}</strong></span>
                     <span>Ready to Benchmark</span>
                   </div>
-                  
+
                   <audio controls src={bmAudioUrl} />
 
                   <div className="btn-group" style={{ marginTop: '0.75rem' }}>
@@ -919,7 +1414,7 @@ export default function App() {
                       onClick={runBenchmark}
                       disabled={bmLoading || selectedModels.length === 0}
                     >
-                      <span>⚡</span> {bmLoading ? 'Transcribing Across Models...' : 'Start Transcribing & Compare'}
+                      <span>⚡</span> {bmLoading ? 'Evaluating Across Models...' : 'Start Benchmark & Accuracy Evaluation'}
                     </button>
 
                     <button
@@ -927,7 +1422,7 @@ export default function App() {
                       onClick={discardBmAudio}
                       disabled={bmLoading}
                     >
-                      <span>🗑️</span> Discard Recording
+                      <span>🗑️</span> Discard Audio
                     </button>
                   </div>
                 </div>
@@ -939,9 +1434,9 @@ export default function App() {
           {bmLoading && (
             <div className="loading-box">
               <div className="spinner"></div>
-              <div><strong>Transcribing across selected models...</strong></div>
+              <div><strong>Transcribing and calculating WER / CER across models...</strong></div>
               <p style={{ fontSize: '0.85rem', color: '#93c5fd' }}>
-                Running inference on models and formatting into Devanagari, Romanised, and English.
+                Executing parallel inference, transliteration, translation, and Levenshtein metric analysis.
               </p>
             </div>
           )}
@@ -951,14 +1446,17 @@ export default function App() {
             <div className="results-grid">
               <div className="results-meta-bar">
                 <span>⏱️ Audio Duration: <strong>{benchmarkData.audio_duration}s</strong></span>
-                <span>🤖 Evaluated Models: <strong>{benchmarkData.results.length}</strong></span>
+                <span>🤖 Models Evaluated: <strong>{benchmarkData.results.length}</strong></span>
+                {benchmarkData.reference_text && (
+                  <span className="ref-eval-tag">🎯 Reference Text Evaluated</span>
+                )}
               </div>
 
               {benchmarkData.results.map((res) => {
                 const isFast = res.real_time_factor <= 0.2;
                 return (
-                  <div 
-                    className={`result-card ${isFast ? 'fast-card' : 'accurate-card'}`} 
+                  <div
+                    className={`result-card ${isFast ? 'fast-card' : 'accurate-card'}`}
                     key={res.model_id}
                   >
                     <div className="result-card-header">
@@ -973,6 +1471,18 @@ export default function App() {
                         <span className={`badge ${res.real_time_factor <= 1.0 ? 'badge-rtf-fast' : 'badge-rtf-slow'}`}>
                           RTF: {res.real_time_factor}x {isFast ? '⚡ Ultra-Fast' : ''}
                         </span>
+
+                        {/* WER & CER Metrics */}
+                        {res.wer !== null && res.wer !== undefined && (
+                          <span className={`badge ${res.wer <= 15 ? 'badge-wer-good' : res.wer <= 35 ? 'badge-wer-med' : 'badge-wer-high'}`}>
+                            WER: {res.wer}%
+                          </span>
+                        )}
+                        {res.cer !== null && res.cer !== undefined && (
+                          <span className="badge badge-cer">
+                            CER: {res.cer}%
+                          </span>
+                        )}
                       </div>
                     </div>
 
@@ -981,7 +1491,7 @@ export default function App() {
                       <div className="modality-block">
                         <div className="modality-header">
                           <span className="modality-tag devanagari-tag">🕉️ Devanagari (Hindi Script)</span>
-                          <button 
+                          <button
                             className="copy-btn"
                             onClick={() => copyToClipboard(res.devanagari || res.transcript, `${res.model_id}_dev`)}
                           >
@@ -997,7 +1507,7 @@ export default function App() {
                       <div className="modality-block">
                         <div className="modality-header">
                           <span className="modality-tag romanised-tag">🔤 Romanised English (Hinglish)</span>
-                          <button 
+                          <button
                             className="copy-btn"
                             onClick={() => copyToClipboard(res.romanised, `${res.model_id}_rom`)}
                           >
@@ -1013,7 +1523,7 @@ export default function App() {
                       <div className="modality-block">
                         <div className="modality-header">
                           <span className="modality-tag english-tag">🌐 Translated English</span>
-                          <button 
+                          <button
                             className="copy-btn"
                             onClick={() => copyToClipboard(res.english, `${res.model_id}_eng`)}
                           >

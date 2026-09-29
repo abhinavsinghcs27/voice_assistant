@@ -4,8 +4,8 @@ from typing import Dict, List, Optional
 
 class SessionManager:
     """
-    In-memory session manager for storing multi-turn conversation history
-    and post-call telemetry state.
+    Session manager for storing multi-turn conversation history,
+    active persona settings, entity memory slots, and real-time telemetry state.
     """
     def __init__(self, max_idle_seconds: int = 1800):
         self.sessions: Dict[str, dict] = {}
@@ -15,24 +15,26 @@ class SessionManager:
         now = time.time()
         expired_ids = [
             sid for sid, data in self.sessions.items()
-            if (now - data["last_active"]) > self.max_idle_seconds
+            if (now - data.get("last_active", 0)) > self.max_idle_seconds
         ]
         for sid in expired_ids:
             del self.sessions[sid]
 
-    def get_or_create_session(self, session_id: Optional[str] = None) -> dict:
+    def get_or_create_session(self, session_id: Optional[str] = None, persona_id: str = "vaani_inbound") -> dict:
         self._cleanup_expired()
         if not session_id or session_id not in self.sessions:
             session_id = f"sess_{uuid.uuid4().hex[:8]}"
             self.sessions[session_id] = {
                 "session_id": session_id,
+                "persona_id": persona_id,
                 "history": [],
                 "telemetry": {
                     "sentiment": "neutral",
                     "sentiment_score": 0.0,
                     "csat_estimate": 3,
                     "detected_intent": "General Inquiry",
-                    "human_escalation_flag": False
+                    "human_escalation_flag": False,
+                    "slots": {}
                 },
                 "finalized_at": None,
                 "record_id": None,
@@ -42,6 +44,8 @@ class SessionManager:
             }
         else:
             self.sessions[session_id]["last_active"] = time.time()
+            if persona_id and "persona_id" not in self.sessions[session_id]:
+                self.sessions[session_id]["persona_id"] = persona_id
         
         return self.sessions[session_id]
 
@@ -53,6 +57,16 @@ class SessionManager:
             "timestamp": time.time()
         })
         session["last_active"] = time.time()
+
+    def record_interruption(self, session_id: str):
+        """Append an interruption flag to the session history so LLM context remains accurate."""
+        if session_id in self.sessions:
+            history = self.sessions[session_id]["history"]
+            if history and history[-1]["role"] == "assistant":
+                if "[Interrupted by User]" not in history[-1]["content"]:
+                    history[-1]["content"] += " [Interrupted by User]"
+            else:
+                self.add_turn(session_id, "system", "[Assistant turn was interrupted by User barge-in]")
 
     def get_history(self, session_id: str) -> List[dict]:
         if session_id in self.sessions:
@@ -77,12 +91,19 @@ class SessionManager:
 
     def update_telemetry(self, session_id: str, telemetry_data: dict):
         if session_id in self.sessions:
-            self.sessions[session_id]["telemetry"].update(telemetry_data)
+            telemetry = self.sessions[session_id]["telemetry"]
+            for k, v in telemetry_data.items():
+                if k == "slots" and isinstance(v, dict):
+                    if "slots" not in telemetry:
+                        telemetry["slots"] = {}
+                    telemetry["slots"].update(v)
+                else:
+                    telemetry[k] = v
 
-    def reset_session(self, session_id: str) -> str:
+    def reset_session(self, session_id: str, persona_id: str = "vaani_inbound") -> str:
         if session_id in self.sessions:
             del self.sessions[session_id]
-        new_session = self.get_or_create_session()
+        new_session = self.get_or_create_session(persona_id=persona_id)
         return new_session["session_id"]
 
 # Global singleton session manager

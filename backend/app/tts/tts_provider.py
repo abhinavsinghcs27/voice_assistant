@@ -5,22 +5,38 @@ import logging
 import tempfile
 import os
 import re
-import edge_tts
+import ssl
 import numpy as np
 import av
-
 from faster_whisper.audio import decode_audio
 
-from app.config import DEFAULT_TTS_VOICE_HINDI, DEFAULT_TTS_VOICE_ENGLISH, TTS_RATE
+# Attempt to import all three TTS backends
+import edge_tts
 
-logger = logging.getLogger("edge_tts_provider")
+try:
+    from gtts import gTTS
+    HAS_GTTS = True
+except ImportError:
+    HAS_GTTS = False
 
-# Split text at sentence/clause boundaries for chunked streaming synthesis
-SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?।])\s+')
+try:
+    import pyttsx3
+    HAS_PYTTSX3 = True
+except ImportError:
+    HAS_PYTTSX3 = False
+
+from app.config import (
+    DEFAULT_TTS_VOICE_HINDI,
+    DEFAULT_TTS_VOICE_ENGLISH,
+    TTS_RATE,
+    DEFAULT_TTS_ENGINE
+)
+
+logger = logging.getLogger("multi_engine_tts_provider")
+
+SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?।\n])\s+')
 MAX_CONCURRENT_FRAGMENTS = 3
 
-# Post-processing: edge-tts pads ~0.7-1s of dead air at each sentence boundary.
-# We trim fragment margins and stitch with a short, natural gap.
 RATE = TTS_RATE
 SAMPLE_RATE = 16000
 TRIM_PAD_S = 0.06          # keep 60ms of silence at fragment edges
@@ -33,13 +49,13 @@ def is_devanagari(text: str) -> bool:
 
 
 def split_sentences(text: str) -> list:
-    """Split text into sentence fragments at `.`, `!`, `?`, and `।` boundaries."""
+    """Split text into sentence fragments at `.`, `!`, `?`, `\n`, and `।` boundaries."""
     parts = [p.strip() for p in SENTENCE_SPLIT_RE.split(text)]
     return [p for p in parts if p]
 
 
 def _trim_edges_f32(samples: np.ndarray) -> np.ndarray:
-    """Cut leading/trailing silence from a fragment (absolute threshold trimmed by 60ms margin)."""
+    """Cut leading/trailing silence from a fragment."""
     if len(samples) == 0:
         return samples
     energy = np.abs(samples)
@@ -74,13 +90,14 @@ def _encode_mp3_f32(samples: np.ndarray) -> bytes:
 
 
 def _trim_and_join(fragments: list) -> bytes:
-    """Trim each fragment's margins then stitch with short gaps, re-encoding to MP3.
-    Removes edge-tts's padded dead air at sentence boundaries without touching speech."""
+    """Trim each fragment's margins then stitch with short gaps, re-encoding to MP3."""
     parts = []
     gap = np.zeros(int(JOIN_GAP_S * SAMPLE_RATE))
     for i, fragment_bytes in enumerate(fragments):
+        if not fragment_bytes:
+            continue
         raw = decode_audio(io.BytesIO(fragment_bytes), sampling_rate=SAMPLE_RATE)
-        if i:
+        if i and len(parts) > 0:
             parts.append(gap)
         parts.append(_trim_edges_f32(raw))
     if not parts:
@@ -89,25 +106,51 @@ def _trim_and_join(fragments: list) -> bytes:
     return _encode_mp3_f32(audio)
 
 
-class GTTSProvider:
-    """Edge‑TTS based provider keeping the original GTTSProvider interface.
-
-    Fully in-memory (no temp files) with sentence-chunked concurrent synthesis:
-    fragments are synthesized in parallel and concatenated in order, so long
-    replies stop at ~1 sentence-fragment time instead of the whole reply time.
+class MultiEngineTTSProvider:
+    """
+    Unified Multi-Engine TTS Provider supporting:
+    1. Microsoft Edge Neural (hi-IN-SwaraNeural / en-IN-NeerjaNeural) with progressive sentence chunking
+    2. Google TTS (gTTS) with global SSL unverified context patch for corporate proxies
+    3. Local OS Engine (pyttsx3 / SAPI5) for 100% offline synthesis with zero network calls
     """
 
-    def __init__(self, default_lang: str = "en"):
-        self.default_lang = default_lang
-        # Natural voice pair: Devanagari -> hi-IN-SwaraNeural (Hindi, female),
-        # Latin/Hinglish -> en-IN-NeerjaNeural (Indian English, female).
-        # Rate boost removes edge-tts's slow drawl.
+    def __init__(self, default_engine: str = DEFAULT_TTS_ENGINE):
+        self.default_engine = default_engine
         self.hindi_voice = DEFAULT_TTS_VOICE_HINDI
         self.english_voice = DEFAULT_TTS_VOICE_ENGLISH
         self.rate = TTS_RATE
 
-    def _select_voice(self, text: str, lang: str | None) -> str:
-        """Select the natural voice based on script/language."""
+    def get_supported_engines(self) -> list:
+        return [
+            {
+                "id": "edge-tts",
+                "name": "Microsoft Edge Neural",
+                "voices": ["hi-IN-SwaraNeural", "en-IN-NeerjaNeural"],
+                "description": "Natural neural voice with sentence-chunked streaming",
+                "is_offline": False,
+                "available": True
+            },
+            {
+                "id": "gtts",
+                "name": "Google TTS (gTTS)",
+                "voices": ["hi (Hindi)", "en (English)"],
+                "description": "Standard HTTPS TTS with corporate SSL tolerance",
+                "is_offline": False,
+                "available": HAS_GTTS
+            },
+            {
+                "id": "pyttsx3",
+                "name": "Local OS Engine (SAPI5 / pyttsx3)",
+                "voices": ["System Default SAPI5"],
+                "description": "Completely offline TTS, 0 network calls, proxy/firewall immune",
+                "is_offline": True,
+                "available": HAS_PYTTSX3
+            }
+        ]
+
+    def _select_edge_voice(self, text: str, lang: str | None, voice_override: str | None = None) -> str:
+        if voice_override:
+            return voice_override
         if lang and lang.startswith("hi"):
             return self.hindi_voice
         if is_devanagari(text):
@@ -115,13 +158,11 @@ class GTTSProvider:
         return self.english_voice
 
     def _sanitize(self, text: str) -> str:
-        """Normalize punctuation that edge-tts reads awkwardly (dashes, spacing)."""
         text = text.replace("—", ", ").replace("–", ", ").replace("-", " ")
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    async def _synthesize_to_bytes(self, text: str, voice: str) -> bytes:
-        """Synthesize text into raw MP3 bytes entirely in memory via edge-tts streaming."""
+    async def _synth_edge_bytes(self, text: str, voice: str) -> bytes:
         communicator = edge_tts.Communicate(text, voice, rate=self.rate)
         buffer = io.BytesIO()
         async for chunk in communicator.stream():
@@ -129,59 +170,118 @@ class GTTSProvider:
                 buffer.write(chunk["data"])
         return buffer.getvalue()
 
-    async def _synthesize_async(self, text: str, voice: str) -> bytes:
-        """In-memory edge-tts synthesis with retry + temp-file fallback."""
-        last_error = None
+    async def _synth_edge_async(self, text: str, voice: str) -> bytes:
         for attempt in range(2):
             try:
-                return await self._synthesize_to_bytes(text, voice)
+                return await self._synth_edge_bytes(text, voice)
             except Exception as e:
-                last_error = e
-                logger.warning(f"edge-tts in-memory attempt {attempt + 1} failed ({text[:30]}...): {e}")
-                await asyncio.sleep(0.3)
-        logger.warning(f"edge-tts retries exhausted, using temp-file fallback: {last_error}")
+                logger.warning(f"edge-tts attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(0.2)
+        # Temp file fallback
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             temp_path = tmp.name
         try:
             await edge_tts.Communicate(text, voice, rate=self.rate).save(temp_path)
             with open(temp_path, "rb") as f:
-                audio_bytes = f.read()
+                return f.read()
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-        return audio_bytes
 
-    async def synthesize(self, text: str, lang: str = None) -> dict:
+    def _synth_gtts_sync(self, text: str, lang: str = "en") -> bytes:
+        if not HAS_GTTS:
+            raise RuntimeError("gTTS package is not installed.")
+        # Ensure SSL verification is bypassed for corporate proxies
+        try:
+            ssl._create_default_https_context = ssl._create_unverified_context
+        except Exception:
+            pass
+        target_lang = "hi" if (lang and lang.startswith("hi")) or is_devanagari(text) else "en"
+        tts = gTTS(text=text, lang=target_lang, slow=False)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        return fp.getvalue()
+
+    def _synth_pyttsx3_sync(self, text: str) -> bytes:
+        if not HAS_PYTTSX3:
+            raise RuntimeError("pyttsx3 package is not installed.")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            temp_path = tmp.name
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty('rate', 170)
+            engine.save_to_file(text, temp_path)
+            engine.runAndWait()
+            with open(temp_path, "rb") as f:
+                raw_wav = f.read()
+            raw_audio = decode_audio(io.BytesIO(raw_wav), sampling_rate=SAMPLE_RATE)
+            return _encode_mp3_f32(raw_audio)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    async def synthesize(
+        self,
+        text: str,
+        lang: str = None,
+        engine: str = None,
+        voice: str = None
+    ) -> dict:
         """
-        Synthesize text to MP3 using Edge-TTS.
-        Async — must be awaited inside FastAPI/uvicorn event loop.
-        Returns a dict with keys: audio_bytes, mime_type, processing_time.
+        Synthesizes text using the chosen engine (edge-tts, gtts, pyttsx3).
+        Defaults to Edge-TTS with sentence-chunked progressive streaming.
         """
         start_time = time.time()
+        chosen_engine = (engine or self.default_engine).lower().strip()
 
         if not text or not text.strip():
             text = "Kripya punah bolein."
 
-        text = self._sanitize(text)
-        voice = self._select_voice(text, lang)
+        sanitized_text = self._sanitize(text)
 
         try:
-            sentences = split_sentences(text)
-            sem = asyncio.Semaphore(MAX_CONCURRENT_FRAGMENTS)
+            if chosen_engine == "pyttsx3" and HAS_PYTTSX3:
+                audio_bytes = await asyncio.to_thread(self._synth_pyttsx3_sync, sanitized_text)
+            elif chosen_engine == "gtts" and HAS_GTTS:
+                audio_bytes = await asyncio.to_thread(self._synth_gtts_sync, sanitized_text, lang)
+            else:
+                # Default: Edge-TTS with sentence-chunked concurrent synthesis
+                selected_voice = self._select_edge_voice(sanitized_text, lang, voice)
+                sentences = split_sentences(sanitized_text)
+                if not sentences:
+                    sentences = [sanitized_text]
 
-            async def synth_fragment(fragment: str) -> bytes:
-                async with sem:
-                    return await self._synthesize_async(fragment, voice)
+                sem = asyncio.Semaphore(MAX_CONCURRENT_FRAGMENTS)
 
-            fragments = await asyncio.gather(*(synth_fragment(s) for s in sentences))
-            audio_bytes = await asyncio.to_thread(_trim_and_join, fragments)
+                async def synth_frag(fragment: str) -> bytes:
+                    async with sem:
+                        return await self._synth_edge_async(fragment, selected_voice)
 
-            elapsed_time = round(time.time() - start_time, 3)
+                fragments = await asyncio.gather(*(synth_frag(s) for s in sentences))
+                audio_bytes = await asyncio.to_thread(_trim_and_join, fragments)
+
+            elapsed = round(time.time() - start_time, 3)
             return {
                 "audio_bytes": audio_bytes,
                 "mime_type": "audio/mp3",
-                "processing_time": elapsed_time,
+                "processing_time": elapsed,
+                "engine_used": chosen_engine
             }
         except Exception as e:
-            logger.error(f"Edge‑TTS synthesis failed for text '{text[:30]}...': {e}")
-            raise RuntimeError(f"Speech synthesis failed: {e}")
+            logger.warning(f"Engine {chosen_engine} failed: {e}. Falling back to default edge-tts.")
+            try:
+                selected_voice = self._select_edge_voice(sanitized_text, lang, voice)
+                audio_bytes = await self._synth_edge_async(sanitized_text, selected_voice)
+                elapsed = round(time.time() - start_time, 3)
+                return {
+                    "audio_bytes": audio_bytes,
+                    "mime_type": "audio/mp3",
+                    "processing_time": elapsed,
+                    "engine_used": "edge-tts-fallback"
+                }
+            except Exception as final_e:
+                raise RuntimeError(f"Speech synthesis completely failed: {final_e}")
+
+
+# Maintain backward compatibility alias
+GTTSProvider = MultiEngineTTSProvider

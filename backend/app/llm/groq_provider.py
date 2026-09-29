@@ -1,32 +1,63 @@
 import json
 import time
 import logging
-from typing import List, Dict
+from typing import List, Dict, Optional
 from groq import AsyncGroq, GroqError
-from app.config import GROQ_API_KEY, GROQ_MODEL, VOICE_ASSISTANT_SYSTEM_PROMPT, FEEDBACK_EXTRACTION_PROMPT
+from app.config import (
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    VOICE_ASSISTANT_SYSTEM_PROMPT,
+    FEEDBACK_EXTRACTION_PROMPT
+)
 
 logger = logging.getLogger("groq_llm")
 
-# Active candidate models in order of priority
+# Active candidate models in order of priority (exact active Groq model IDs)
 GROQ_MODELS = [
     GROQ_MODEL,
-    "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
-    "groq/compound-mini",
-    "qwen/qwen3.6-27b"
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 
-TELEMETRY_SYSTEM_PROMPT = """You are an automated customer conversation analyst for a Razorpay payment voice assistant.
+TELEMETRY_SYSTEM_PROMPT = """You are an automated real-time conversation analyst for a multi-domain voice assistant.
 Analyze the user's speech message and the conversation context.
+Extract sentiment, estimated CSAT rating, intent, human escalation flag, and any active entity slots (e.g. order_id, product, issue_category, machinery_model, fault_code, status).
 Output ONLY a valid JSON object matching this exact schema:
 {
-  "sentiment": "positive" | "neutral" | "frustrated",
+  "sentiment": "positive" | "neutral" | "negative" | "frustrated",
   "sentiment_score": float between -1.0 and 1.0,
   "csat_estimate": integer between 1 and 5,
-  "detected_intent": short string describing user intent (e.g. "Refund Inquiry", "QR Settlement", "UPI Failure", "General Support"),
-  "human_escalation_flag": boolean (true if user shows high frustration, anger, or explicitly demands a human agent, else false)
+  "detected_intent": short string describing user intent,
+  "human_escalation_flag": boolean,
+  "slots": {
+    "order_id": "extracted string or null",
+    "product": "extracted string or null",
+    "issue_category": "extracted string or null",
+    "machinery_model": "extracted string or null",
+    "fault_code": "extracted string or null",
+    "resolution_status": "in_progress" | "resolved" | "escalated"
+  }
 }
 Do NOT include markdown block markers (no ```json). Output pure JSON only."""
+
+
+def _clean_json_str(raw: str) -> str:
+    raw = raw.strip()
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            p = part.strip()
+            if p.startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{") and p.endswith("}"):
+                return p
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        return raw[first_brace:last_brace + 1]
+    return raw
+
 
 class GroqLLMProvider:
     def __init__(self, api_key: str = None):
@@ -39,11 +70,8 @@ class GroqLLMProvider:
         self,
         user_message: str,
         system_prompt: str = VOICE_ASSISTANT_SYSTEM_PROMPT,
-        temperature: float = 0.7
+        temperature: float = 0.6
     ) -> dict:
-        """
-        Single-turn LLM completion fallback.
-        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
@@ -53,11 +81,8 @@ class GroqLLMProvider:
     async def generate_conversation_response(
         self,
         messages: List[Dict[str, str]],
-        temperature: float = 0.7
+        temperature: float = 0.6
     ) -> dict:
-        """
-        Generates LLM completion for multi-turn conversation messages.
-        """
         start_time = time.time()
         last_error = None
 
@@ -68,7 +93,6 @@ class GroqLLMProvider:
 
         for model_name in candidate_models:
             try:
-                logger.info(f"Sending multi-turn conversation prompt to Groq model: {model_name}")
                 response = await self.client.chat.completions.create(
                     model=model_name,
                     messages=messages,
@@ -96,16 +120,21 @@ class GroqLLMProvider:
     async def analyze_sentiment_and_telemetry(
         self,
         user_message: str,
-        conversation_history: List[Dict[str, str]] = None
+        conversation_history: List[Dict[str, str]] = None,
+        existing_slots: dict = None
     ) -> dict:
         """
-        Extracts real-time sentiment, CSAT rating, intent, and human escalation flags.
+        Extracts real-time sentiment, CSAT rating, intent, human escalation flags, and memory slots.
         """
         history_summary = ""
         if conversation_history:
             history_summary = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in conversation_history[-4:]])
 
-        prompt_input = f"Conversation History:\n{history_summary}\nLatest User Input: {user_message}"
+        prompt_input = (
+            f"Conversation History:\n{history_summary}\n"
+            f"Current Known Slots: {json.dumps(existing_slots or {})}\n"
+            f"Latest User Input: {user_message}"
+        )
 
         for model_name in GROQ_MODELS:
             try:
@@ -116,52 +145,49 @@ class GroqLLMProvider:
                         {"role": "user", "content": prompt_input}
                     ],
                     temperature=0.1,
-                    max_tokens=150
+                    max_tokens=220
                 )
-                raw_json = response.choices[0].message.content.strip()
-                # Clean up any potential markdown formatting
-                if raw_json.startswith("```"):
-                    raw_json = raw_json.split("```")[1]
-                    if raw_json.startswith("json"):
-                        raw_json = raw_json[4:]
-                    raw_json = raw_json.strip()
-
+                raw_json = _clean_json_str(response.choices[0].message.content)
                 telemetry = json.loads(raw_json)
+                extracted_slots = telemetry.get("slots", {}) or {}
+                # Merge with existing slots
+                merged_slots = dict(existing_slots or {})
+                for k, v in extracted_slots.items():
+                    if v is not None and str(v).strip() != "":
+                        merged_slots[k] = v
+
                 return {
                     "sentiment": telemetry.get("sentiment", "neutral"),
                     "sentiment_score": float(telemetry.get("sentiment_score", 0.0)),
                     "csat_estimate": int(telemetry.get("csat_estimate", 3)),
                     "detected_intent": str(telemetry.get("detected_intent", "General Inquiry")),
-                    "human_escalation_flag": bool(telemetry.get("human_escalation_flag", False))
+                    "human_escalation_flag": bool(telemetry.get("human_escalation_flag", False)),
+                    "slots": merged_slots
                 }
             except Exception as e:
                 logger.warning(f"Telemetry analysis with {model_name} failed: {e}")
                 continue
 
-        # Fallback default if LLM telemetry call fails
-        is_frustrated = any(w in user_message.lower() for w in ["bad", "worst", "fail", "fraud", "problem", "angry", "kyon nahi", "stuck"])
+        # Fallback heuristic
+        is_frustrated = any(w in user_message.lower() for w in ["bad", "worst", "fail", "fraud", "problem", "angry", "kyon nahi", "stuck", "kharab", "nahi chal raha"])
         return {
             "sentiment": "frustrated" if is_frustrated else "neutral",
             "sentiment_score": -0.5 if is_frustrated else 0.0,
             "csat_estimate": 2 if is_frustrated else 4,
             "detected_intent": "Customer Support",
-            "human_escalation_flag": is_frustrated
+            "human_escalation_flag": is_frustrated,
+            "slots": existing_slots or {}
         }
 
     async def extract_structured_feedback(
         self,
         conversation_history: List[Dict[str, str]],
-        telemetry: dict = None
+        telemetry: dict = None,
+        persona_info: dict = None
     ) -> dict:
         """
-        Phase 2: Aggregates the full conversation transcript into a single
-        structured feedback JSON record for customer service DB ingestion.
-
-        Returns a dict with keys:
-        - feedback: structured JSON record
-        - model_used: str or None (None in degraded mode)
-        - processing_time: float
-        - extraction_status: "success" | "fallback_heuristic"
+        Aggregates the full conversation transcript and resolved memory slots into a
+        structured feedback JSON record for post-call analysis.
         """
         start_time = time.time()
 
@@ -174,12 +200,15 @@ class GroqLLMProvider:
                 content = content[:600] + "..."
             lines.append(f"{role}: {content}")
         transcript_text = "\n".join(lines)
-        prompt_input = f"Full Conversation Transcript:\n{transcript_text}"
+        prompt_input = (
+            f"Persona Info: {json.dumps(persona_info or {})}\n"
+            f"Accumulated Telemetry & Slots: {json.dumps(telemetry or {})}\n\n"
+            f"Full Conversation Transcript:\n{transcript_text}"
+        )
 
         last_error = None
         for model_name in GROQ_MODELS:
             try:
-                logger.info(f"Extracting structured feedback with Groq model: {model_name}")
                 response = await self.client.chat.completions.create(
                     model=model_name,
                     messages=[
@@ -187,15 +216,9 @@ class GroqLLMProvider:
                         {"role": "user", "content": prompt_input}
                     ],
                     temperature=0.1,
-                    max_tokens=800
+                    max_tokens=850
                 )
-                raw_json = response.choices[0].message.content.strip()
-                if raw_json.startswith("```"):
-                    raw_json = raw_json.split("```")[1]
-                    if raw_json.startswith("json"):
-                        raw_json = raw_json[4:]
-                    raw_json = raw_json.strip()
-
+                raw_json = _clean_json_str(response.choices[0].message.content)
                 feedback = json.loads(raw_json)
                 return {
                     "feedback": feedback,
@@ -207,26 +230,26 @@ class GroqLLMProvider:
                 logger.warning(f"Structured feedback extraction with {model_name} failed: {e}")
                 last_error = e
 
-        # Degraded mode: build a valid record from per-turn telemetry so DB ingestion
-        # never receives a 500.
+        # Degraded fallback
         if telemetry:
             flag = bool(telemetry.get("human_escalation_flag", False))
-            sentiment_map = {"positive": "positive", "frustrated": "negative", "neutral": "neutral"}
+            sentiment_map = {"positive": "positive", "frustrated": "frustrated", "negative": "negative", "neutral": "neutral"}
             aggregate = sentiment_map.get(telemetry.get("sentiment", "neutral"), "neutral")
             feedback = {
-                "schema_version": "1.0",
+                "schema_version": "2.0",
                 "aggregate_sentiment": aggregate,
                 "sentiment_score": float(telemetry.get("sentiment_score", 0.0)),
                 "overall_satisfaction": int(telemetry.get("csat_estimate", 3)),
-                "primary_complaints": ["[unable to auto-extract complaints]"] if aggregate == "negative" else [],
+                "primary_complaints": ["[unable to auto-extract complaints]"] if aggregate in ["negative", "frustrated"] else [],
                 "positive_highlights": [],
                 "suggestions": [],
                 "key_topics": [str(telemetry.get("detected_intent", "General Inquiry"))],
                 "follow_up_required": flag,
                 "action_items": ["Review session for follow-up"] if flag else [],
                 "resolution_status": "escalated" if flag else "resolved",
-                "summary_hindi": "",
-                "summary_english": ""
+                "extracted_slots": telemetry.get("slots", {}),
+                "summary_hindi": "Call complete hui.",
+                "summary_english": "Call completed successfully."
             }
             return {
                 "feedback": feedback,
