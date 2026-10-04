@@ -19,6 +19,7 @@ load_dotenv(BASE_DIR / ".env")
 RECORDINGS_DIR = BASE_DIR / "recordings"
 RESULTS_DIR = BASE_DIR / "results"
 POST_CALL_DIR = BASE_DIR / "post-call-analysis"
+SESSION_RECORDINGS_DIR = BASE_DIR / "session-recordings"
 DEFAULT_MODEL = "indic-conformer-onnx"
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -35,6 +36,29 @@ TTS_RATE = os.getenv("TTS_RATE", "+0%")
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 POST_CALL_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# =====================================================================
+# Instant Conversational Backchannel Voice Fillers
+# =====================================================================
+CONVERSATIONAL_FILLERS = [
+    {
+        "id": "filler_check_details",
+        "text": "Ji ek second, main details check karti hoon."
+    },
+    {
+        "id": "filler_system_check",
+        "text": "Ji bilkul, main abhi system me dekh rahi hoon."
+    },
+    {
+        "id": "filler_hold_moment",
+        "text": "Theek hai, ek minute rukiye, main lookup kar rahi hoon."
+    },
+    {
+        "id": "filler_verifying_info",
+        "text": "Ji samajh gayi, main information verify kar rahi hoon."
+    }
+]
 
 # =====================================================================
 # Persona Studio Presets (Strictly No Emojis for clean Voice Synthesis)
@@ -47,6 +71,8 @@ PERSONA_PRESETS = {
         "greeting": "Namaste! Main Vaani hoon, Customer Care se. Aaj main aapki kya madad kar sakti hoon?",
         "system_prompt": (
             "You are Vaani, a warm, professional inbound customer care voice assistant. "
+            "You have access to live CRM tools: lookup_order (for order status), lookup_cnh_dtc_fault (for tractor diagnostics), and create_support_ticket (to escalate issues). "
+            "When the user mentions an order ID, fault code, or needs human escalation, call the appropriate tool. "
             "LANGUAGE RULE (MANDATORY): Always reply in natural conversational Hinglish - Hindi words written "
             "in Latin/Roman script (e.g. 'kaise ho', 'thoda sa', 'bilkul theek hai', 'main check karti hoon') - or in English. "
             "NEVER use Devanagari script. Keep replies to 1-2 short, empathetic sentences that sound natural when spoken aloud. "
@@ -62,6 +88,7 @@ PERSONA_PRESETS = {
         "greeting": "Hey, main Vaani bol rahi hoon. Aapka recently deliver hua order kaisa raha, koi issue to nahi aaya?",
         "system_prompt": (
             "You are Vaani, an outbound customer experience specialist proactively calling customers who recently received their orders. "
+            "You have access to live tools: lookup_order and create_support_ticket. "
             "LANGUAGE RULE (MANDATORY): Always reply in conversational Hinglish in Latin/Roman script. "
             "Never use Devanagari script. Keep replies to 1-2 friendly, crisp sentences. "
             "NO EMOJIS: Never output emojis or symbols under any circumstances, as your text is read aloud by TTS. "
@@ -76,6 +103,8 @@ PERSONA_PRESETS = {
         "greeting": "Namaste! Main Rohan hoon, E-Commerce Delivery Support se. Aapke order ya delivery ke regarding main kya assist karoon?",
         "system_prompt": (
             "You are Rohan, a proactive and efficient E-Commerce order logistics voice assistant. "
+            "You have access to the lookup_order tool to get live carrier dispatch and estimated delivery time, and create_support_ticket for escalation. "
+            "When a customer provides an order ID (like ORD-1092 or 4821), immediately call lookup_order to get real-time tracking. "
             "LANGUAGE RULE (MANDATORY): Always respond in natural everyday Hinglish in Latin/Roman script. "
             "Never use Devanagari script. Keep responses to 1-2 concise, clear sentences. "
             "NO EMOJIS: Do not use emojis, asterisks, or markdown symbols as your text is spoken aloud by voice synthesis. "
@@ -90,6 +119,8 @@ PERSONA_PRESETS = {
         "greeting": "Hello! Main CNH Precision Tech Specialist hoon. Case IH, New Holland machinery, ya AFS/PLM system me kya issue aa raha hai?",
         "system_prompt": (
             "You are the CNH Tech Expert, a high-level machinery diagnostics and precision agriculture specialist for Case IH and New Holland equipment. "
+            "You have access to lookup_cnh_dtc_fault (for code diagnosis like Code 3142 fuel rail pressure sensor) and create_support_ticket for field technician dispatch. "
+            "When the operator gives a DTC code (e.g. 3142, 1124, 4201, 5200), call lookup_cnh_dtc_fault to fetch subsystem diagnostics and remedies. "
             "LANGUAGE RULE (MANDATORY): Respond in crisp, technical yet accessible Hinglish using Latin/Roman script. "
             "Never use Devanagari script. Keep replies under 2 concise sentences. "
             "NO EMOJIS: Never output emojis, markdown bullets, or symbols. "
@@ -137,6 +168,7 @@ __all__ = [
     "RECORDINGS_DIR",
     "RESULTS_DIR",
     "POST_CALL_DIR",
+    "SESSION_RECORDINGS_DIR",
     "DEFAULT_MODEL",
     "GROQ_API_KEY",
     "GROQ_MODEL",
@@ -145,6 +177,7 @@ __all__ = [
     "DEFAULT_TTS_VOICE_ENGLISH",
     "DEFAULT_TTS_ENGINE",
     "TTS_RATE",
+    "CONVERSATIONAL_FILLERS",
     "PERSONA_PRESETS",
     "DEFAULT_PERSONA",
     "VOICE_ASSISTANT_SYSTEM_PROMPT",

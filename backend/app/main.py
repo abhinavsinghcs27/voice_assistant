@@ -8,8 +8,9 @@ import time
 import ssl
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("main_api")
@@ -25,9 +26,11 @@ from app.config import (
     RECORDINGS_DIR,
     RESULTS_DIR,
     POST_CALL_DIR,
+    SESSION_RECORDINGS_DIR,
     GROQ_API_KEY,
     VOICE_ASSISTANT_SYSTEM_PROMPT,
     GREETING_TEXT,
+    CONVERSATIONAL_FILLERS,
     PERSONA_PRESETS,
     DEFAULT_PERSONA,
     DEFAULT_TTS_ENGINE
@@ -39,6 +42,13 @@ from app.llm.groq_provider import GroqLLMProvider
 from app.tts.tts_provider import MultiEngineTTSProvider
 from app.formatter import format_speech_output
 from app.session_manager import session_manager
+from app.tools import (
+    TOOLS_DEFINITIONS,
+    execute_tool,
+    lookup_order,
+    lookup_cnh_dtc_fault,
+    create_support_ticket
+)
 
 app = FastAPI(title="Hindi/Hinglish STT Benchmark & Voice Assistant API", version="3.0.0")
 
@@ -84,6 +94,9 @@ tts_provider = MultiEngineTTSProvider()
 
 # Pre-baked greetings cache keyed by persona_id + tts_engine
 greeting_audio_cache = {}
+
+# Pre-baked instant voice backchannel fillers cache
+filler_audio_cache: List[Dict[str, Any]] = []
 
 
 def compute_levenshtein(seq1: list, seq2: list) -> int:
@@ -135,14 +148,32 @@ def calculate_wer_cer(reference: str, hypothesis: str) -> dict:
 
 
 @app.on_event("startup")
-async def warm_greeting():
-    """Synthesize the default greeting at startup for instant ~0ms start."""
+async def warm_startup_assets():
+    """Synthesize default greeting and pre-bake instant backchannel fillers for zero-latency latency masking."""
+    global filler_audio_cache
+    # 1. Pre-bake Default Greeting
     try:
         tts_res = await tts_provider.synthesize(text=GREETING_TEXT, engine="edge-tts")
         greeting_audio_cache["vaani_inbound_edge-tts"] = tts_res["audio_bytes"]
         print("Default greeting pre-baked at startup.")
     except Exception as e:
         print(f"Greeting pre-bake error: {e}")
+
+    # 2. Pre-bake Conversational Fillers
+    filler_audio_cache = []
+    for filler in CONVERSATIONAL_FILLERS:
+        try:
+            tts_res = await tts_provider.synthesize(text=filler["text"], engine="edge-tts")
+            b64_audio = base64.b64encode(tts_res["audio_bytes"]).decode("utf-8")
+            filler_audio_cache.append({
+                "id": filler["id"],
+                "text": filler["text"],
+                "audio_url": f"data:audio/mp3;base64,{b64_audio}",
+                "engine": tts_res.get("engine_used", "edge-tts")
+            })
+            print(f"Pre-baked voice filler: '{filler['text']}'")
+        except Exception as e:
+            print(f"Voice filler bake error for {filler['id']}: {e}")
 
 
 def get_provider(model_key: str):
@@ -281,7 +312,7 @@ async def voice_assistant_interact(
 ):
     """
     Multi-Turn End-to-End Voice Assistant Pipeline:
-    Audio -> STT (In-Memory) -> Persona System Prompt + History -> Groq LLM (Parallel with Telemetry/Slots) -> Multi-Engine TTS -> Response
+    Audio -> STT (In-Memory) -> Persona System Prompt + History -> Groq LLM with Tool Calling -> Multi-Engine TTS -> Session Recording Archival -> Response
     """
     total_start = time.time()
     rec_id = f"va_{uuid.uuid4().hex[:6]}"
@@ -311,7 +342,7 @@ async def voice_assistant_interact(
         user_text = raw_transcript.strip() or "[Audio unclear or silent]"
         format_task = asyncio.create_task(asyncio.to_thread(format_speech_output, raw_transcript))
 
-        # Stage 2 & 4: LLM reasoning + telemetry / slot extraction run concurrently
+        # Stage 2 & 4: LLM reasoning with tool execution + telemetry / slot extraction run concurrently
         llm_start = time.time()
         groq_llm = get_llm_provider()
 
@@ -323,7 +354,7 @@ async def voice_assistant_interact(
         messages_payload.extend(existing_history)
         messages_payload.append({"role": "user", "content": user_text})
 
-        llm_task = groq_llm.generate_conversation_response(messages=messages_payload)
+        llm_task = groq_llm.generate_conversation_response(messages=messages_payload, allow_tools=True)
         telemetry_task = asyncio.create_task(
             groq_llm.analyze_sentiment_and_telemetry(
                 user_message=user_text,
@@ -335,6 +366,7 @@ async def voice_assistant_interact(
         llm_res = await llm_task
         llm_latency = llm_res["processing_time"]
         llm_text = llm_res["text"]
+        executed_tools = llm_res.get("tool_calls_executed", [])
 
         # Stage 3: Multi-Engine TTS (Edge-TTS, gTTS, or pyttsx3)
         tts_start = time.time()
@@ -342,9 +374,44 @@ async def voice_assistant_interact(
         tts_latency = tts_res["processing_time"]
         audio_bytes = tts_res["audio_bytes"]
 
-        # Record turns in session state
-        session_manager.add_turn(active_session_id, "user", user_text)
-        session_manager.add_turn(active_session_id, "assistant", llm_text)
+        # Stage 5: Session Audio Recording Archival
+        turn_idx = (len(existing_history) // 2) + 1
+        sess_audio_dir = SESSION_RECORDINGS_DIR / active_session_id
+        sess_audio_dir.mkdir(parents=True, exist_ok=True)
+
+        user_filename = f"turn_{turn_idx}_user.webm"
+        assistant_filename = f"turn_{turn_idx}_assistant.mp3"
+        user_audio_path = sess_audio_dir / user_filename
+        assistant_audio_path = sess_audio_dir / assistant_filename
+
+        try:
+            with open(user_audio_path, "wb") as f:
+                f.write(audio_data)
+            with open(assistant_audio_path, "wb") as f:
+                f.write(audio_bytes)
+        except Exception as e:
+            logger.warning(f"Error archiving turn audio: {e}")
+
+        user_recording_url = f"/api/voice-assistant/recordings/{active_session_id}/{user_filename}"
+        assistant_recording_url = f"/api/voice-assistant/recordings/{active_session_id}/{assistant_filename}"
+
+        # Record turns in session state with metadata
+        session_manager.add_turn(
+            active_session_id,
+            "user",
+            user_text,
+            metadata={"audio_url": user_recording_url, "turn_index": turn_idx}
+        )
+        session_manager.add_turn(
+            active_session_id,
+            "assistant",
+            llm_text,
+            metadata={
+                "audio_url": assistant_recording_url,
+                "turn_index": turn_idx,
+                "tool_calls": executed_tools
+            }
+        )
 
         total_latency = round(time.time() - total_start, 3)
 
@@ -356,6 +423,29 @@ async def voice_assistant_interact(
             pass
         if telemetry_res:
             session_manager.update_telemetry(active_session_id, telemetry_res)
+
+        # Dynamic slot updates from executed tools
+        if executed_tools:
+            tool_slots_update = {}
+            for t in executed_tools:
+                t_name = t.get("tool")
+                t_args = t.get("arguments", {})
+                t_res = t.get("result", {})
+                if t_name == "lookup_order":
+                    tool_slots_update["order_id"] = t_args.get("order_id")
+                    if t_res.get("found"):
+                        tool_slots_update["product"] = t_res.get("data", {}).get("product")
+                        tool_slots_update["carrier"] = t_res.get("data", {}).get("carrier")
+                elif t_name == "lookup_cnh_dtc_fault":
+                    tool_slots_update["fault_code"] = t_args.get("fault_code")
+                    if t_res.get("found"):
+                        tool_slots_update["subsystem"] = t_res.get("data", {}).get("subsystem")
+                elif t_name == "create_support_ticket":
+                    tool_slots_update["ticket_id"] = t_res.get("ticket_id")
+                    tool_slots_update["resolution_status"] = "escalated"
+                    session_manager.update_telemetry(active_session_id, {"human_escalation_flag": True})
+            if tool_slots_update:
+                session_manager.update_telemetry(active_session_id, {"slots": tool_slots_update})
 
         if return_binary:
             return Response(
@@ -390,9 +480,13 @@ async def voice_assistant_interact(
             "id": rec_id,
             "session_id": active_session_id,
             "persona_id": persona_id,
+            "turn_index": turn_idx,
             "tts_engine_used": tts_res.get("engine_used", tts_engine),
             "turn_history": updated_session["history"],
             "telemetry": updated_session["telemetry"],
+            "tool_calls": executed_tools,
+            "user_recording_url": user_recording_url,
+            "assistant_recording_url": assistant_recording_url,
             "user_transcript": {
                 "raw": raw_transcript,
                 "devanagari": formatted_stt["devanagari"],
@@ -414,6 +508,76 @@ async def voice_assistant_interact(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Voice Assistant Error: {str(e)}")
+
+
+@app.get("/api/voice-assistant/fillers")
+async def get_conversational_fillers():
+    """
+    Returns pre-synthesized ultra-low latency voice filler audio clips
+    for instant audio backchanneling and perceptual latency masking.
+    """
+    return {
+        "fillers": filler_audio_cache,
+        "count": len(filler_audio_cache)
+    }
+
+
+@app.get("/api/voice-assistant/recordings/{session_id}/{filename}")
+async def get_session_recording(session_id: str, filename: str):
+    """
+    Streams an individual turn audio recording from backend/session-recordings/.
+    """
+    rec_path = SESSION_RECORDINGS_DIR / session_id / filename
+    if not rec_path.exists():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+    media_type = "audio/webm" if filename.endswith(".webm") else "audio/mp3" if filename.endswith(".mp3") else "audio/wav"
+    return FileResponse(rec_path, media_type=media_type, filename=filename)
+
+
+@app.get("/api/voice-assistant/sessions/{session_id}/recordings")
+async def get_session_recordings_list(session_id: str):
+    """
+    Lists all recorded audio files for a given session.
+    """
+    sess_audio_dir = SESSION_RECORDINGS_DIR / session_id
+    if not sess_audio_dir.exists():
+        return {"session_id": session_id, "recordings": []}
+    files = sorted(sess_audio_dir.iterdir(), key=lambda p: p.stat().st_mtime)
+    recs = [
+        {
+            "filename": f.name,
+            "url": f"/api/voice-assistant/recordings/{session_id}/{f.name}",
+            "size_bytes": f.stat().st_size,
+            "type": "user" if "user" in f.name else "assistant"
+        }
+        for f in files if f.is_file()
+    ]
+    return {"session_id": session_id, "recordings": recs}
+
+
+# =====================================================================
+# Dedicated Direct External Tool API Endpoints
+# =====================================================================
+@app.post("/api/tools/lookup_order")
+async def api_lookup_order(order_id: str = Form(...)):
+    """Live carrier dispatch and estimated delivery time lookup."""
+    return lookup_order(order_id)
+
+
+@app.post("/api/tools/lookup_cnh_dtc_fault")
+async def api_lookup_cnh_dtc_fault(fault_code: str = Form(...)):
+    """CNH Industrial tractor telematics subsystem diagnostics lookup."""
+    return lookup_cnh_dtc_fault(fault_code)
+
+
+@app.post("/api/tools/create_support_ticket")
+async def api_create_support_ticket(
+    issue_summary: str = Form(...),
+    customer_name: str = Form(None),
+    priority: str = Form("High")
+):
+    """Live CRM support ticket creation with escalation SLA tracking."""
+    return create_support_ticket(issue_summary=issue_summary, customer_name=customer_name, priority=priority)
 
 
 @app.post("/api/voice-assistant/barge-in")
@@ -491,12 +655,25 @@ async def finalize_session(session_id: str = Form(None)):
     if not history:
         raise HTTPException(status_code=400, detail="No conversation history to analyze.")
 
+    # Collect all saved audio recordings for this session
+    sess_audio_dir = SESSION_RECORDINGS_DIR / session_id
+    recordings_list = []
+    if sess_audio_dir.exists():
+        for f in sorted(sess_audio_dir.iterdir(), key=lambda p: p.stat().st_mtime):
+            if f.is_file():
+                recordings_list.append({
+                    "filename": f.name,
+                    "url": f"/api/voice-assistant/recordings/{session_id}/{f.name}",
+                    "type": "user" if "user" in f.name else "assistant"
+                })
+
     if session.get("finalized_at") and session.get("feedback_record"):
         return {
             "record_id": session["record_id"],
             "session_id": session_id,
             "turn_count": len(history),
             "structured_feedback": session["feedback_record"],
+            "recordings": recordings_list,
             "already_finalized": True
         }
 
@@ -524,6 +701,7 @@ async def finalize_session(session_id: str = Form(None)):
         "model_used": extraction["model_used"],
         "sentiment_score": extraction["feedback"].get("sentiment_score"),
         "transcript": history,
+        "recordings": recordings_list
     })
 
     # Persist: pretty per-call JSON + line-delimited JSONL
@@ -542,6 +720,7 @@ async def finalize_session(session_id: str = Form(None)):
         "session_id": session_id,
         "turn_count": len(history),
         "structured_feedback": feedback_record,
+        "recordings": recordings_list,
         "already_finalized": False
     }
 
@@ -563,6 +742,21 @@ async def get_all_reports():
             try:
                 with open(jf, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    
+                    # Ensure recordings are present even if report was created earlier
+                    sid = data.get("session_id")
+                    if sid and (not data.get("recordings") or len(data.get("recordings")) == 0):
+                        sdir = SESSION_RECORDINGS_DIR / sid
+                        if sdir.exists():
+                            data["recordings"] = [
+                                {
+                                    "filename": f.name,
+                                    "url": f"/api/voice-assistant/recordings/{sid}/{f.name}",
+                                    "type": "user" if "user" in f.name else "assistant"
+                                }
+                                for f in sorted(sdir.iterdir(), key=lambda p: p.stat().st_mtime) if f.is_file()
+                            ]
+                    
                     reports.append(data)
                     csat = data.get("overall_satisfaction", 3)
                     total_csat += csat
@@ -598,4 +792,17 @@ async def get_report_by_id(record_id: str):
     if not report_file.exists():
         raise HTTPException(status_code=404, detail="Report not found.")
     with open(report_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+        sid = data.get("session_id")
+        if sid and (not data.get("recordings") or len(data.get("recordings")) == 0):
+            sdir = SESSION_RECORDINGS_DIR / sid
+            if sdir.exists():
+                data["recordings"] = [
+                    {
+                        "filename": f.name,
+                        "url": f"/api/voice-assistant/recordings/{sid}/{f.name}",
+                        "type": "user" if "user" in f.name else "assistant"
+                    }
+                    for f in sorted(sdir.iterdir(), key=lambda p: p.stat().st_mtime) if f.is_file()
+                ]
+        return data

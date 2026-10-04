@@ -10,6 +10,8 @@ from app.config import (
     FEEDBACK_EXTRACTION_PROMPT
 )
 
+from app.tools import TOOLS_DEFINITIONS, execute_tool
+
 logger = logging.getLogger("groq_llm")
 
 # Active candidate models in order of priority (exact active Groq model IDs)
@@ -81,10 +83,12 @@ class GroqLLMProvider:
     async def generate_conversation_response(
         self,
         messages: List[Dict[str, str]],
-        temperature: float = 0.6
+        temperature: float = 0.6,
+        allow_tools: bool = True
     ) -> dict:
         start_time = time.time()
         last_error = None
+        executed_tools = []
 
         candidate_models = []
         for m in GROQ_MODELS:
@@ -93,20 +97,84 @@ class GroqLLMProvider:
 
         for model_name in candidate_models:
             try:
-                response = await self.client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=256
-                )
+                # Copy messages payload so we can mutate safely if tools are called
+                conv_messages = [dict(m) for m in messages]
+
+                # Attempt 1: Call with tools enabled
+                req_kwargs = {
+                    "model": model_name,
+                    "messages": conv_messages,
+                    "temperature": temperature,
+                    "max_tokens": 256
+                }
+                if allow_tools:
+                    req_kwargs["tools"] = TOOLS_DEFINITIONS
+                    req_kwargs["tool_choice"] = "auto"
+
+                response = await self.client.chat.completions.create(**req_kwargs)
+                choice = response.choices[0]
+                message = choice.message
+
+                # Check if tool calls were triggered
+                if getattr(message, "tool_calls", None) and len(message.tool_calls) > 0:
+                    # Append assistant's tool-call request to dialog
+                    tool_calls_data = []
+                    for tc in message.tool_calls:
+                        tool_calls_data.append({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        })
+
+                    conv_messages.append({
+                        "role": "assistant",
+                        "content": message.content or "",
+                        "tool_calls": tool_calls_data
+                    })
+
+                    # Execute each tool
+                    for tc in message.tool_calls:
+                        fn_name = tc.function.name
+                        try:
+                            fn_args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                        except Exception:
+                            fn_args = {}
+                        
+                        tool_res = execute_tool(fn_name, fn_args)
+                        executed_tools.append({
+                            "tool": fn_name,
+                            "arguments": fn_args,
+                            "result": tool_res
+                        })
+
+                        conv_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "name": fn_name,
+                            "content": json.dumps(tool_res, ensure_ascii=False)
+                        })
+
+                    # Second call to get final conversational speech with tool results incorporated
+                    follow_up = await self.client.chat.completions.create(
+                        model=model_name,
+                        messages=conv_messages,
+                        temperature=temperature,
+                        max_tokens=256
+                    )
+                    reply_text = follow_up.choices[0].message.content.strip()
+                else:
+                    reply_text = (message.content or "").strip()
 
                 elapsed_time = round(time.time() - start_time, 3)
-                reply_text = response.choices[0].message.content.strip()
 
                 return {
                     "text": reply_text,
                     "model_used": model_name,
-                    "processing_time": elapsed_time
+                    "processing_time": elapsed_time,
+                    "tool_calls_executed": executed_tools
                 }
             except GroqError as ge:
                 logger.warning(f"Groq model {model_name} failed: {ge}")

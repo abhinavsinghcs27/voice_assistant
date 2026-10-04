@@ -19,6 +19,20 @@ export default function App() {
   const [customGreeting, setCustomGreeting] = useState('');
   const [vadThresholdSeconds, setVadThresholdSeconds] = useState(1.2); // 0.6s to 2.5s
   const [showPromptEditor, setShowPromptEditor] = useState(false);
+  const [enableBackchanneling, setEnableBackchanneling] = useState(true);
+  const [showToolSimulator, setShowToolSimulator] = useState(false);
+
+  // Conversational Fillers State
+  const [fillers, setFillers] = useState([]);
+  const [backchannelActive, setBackchannelActive] = useState(false);
+
+  // Tool Simulator State
+  const [simOrderInput, setSimOrderInput] = useState('ORD-1092');
+  const [simOrderRes, setSimOrderRes] = useState(null);
+  const [simFaultInput, setSimFaultInput] = useState('3142');
+  const [simFaultRes, setSimFaultRes] = useState(null);
+  const [simTicketInput, setSimTicketInput] = useState('Engine fuel rail sensor voltage erratic in field');
+  const [simTicketRes, setSimTicketRes] = useState(null);
 
   // Voice Assistant Live Call State
   const [vaCallActive, setVaCallActive] = useState(false);
@@ -47,6 +61,7 @@ export default function App() {
   });
   const [callLogs, setCallLogs] = useState([]);
   const [selectedReportModal, setSelectedReportModal] = useState(null);
+  const [expandedCallId, setExpandedCallId] = useState(null);
 
   // Benchmark State
   const [selectedModels, setSelectedModels] = useState([]);
@@ -71,6 +86,7 @@ export default function App() {
   const vaTimerRef = useRef(null);
   const vaLiveAudioRef = useRef(null);
   const vaGreetAudioRef = useRef(null);
+  const vaFillerAudioRef = useRef(null);
   const vaCallActiveRef = useRef(false);
   const vaPhaseRef = useRef('idle');
   const vaSessionIdRef = useRef(null);
@@ -99,12 +115,16 @@ export default function App() {
     Promise.all([
       fetch('/api/models').then(r => r.json()).catch(() => []),
       fetch('/api/tts/engines').then(r => r.json()).catch(() => []),
-      fetch('/api/personas').then(r => r.json()).catch(() => [])
-    ]).then(([modelsList, ttsList, personasList]) => {
+      fetch('/api/personas').then(r => r.json()).catch(() => []),
+      fetch('/api/voice-assistant/fillers').then(r => r.json()).catch(() => ({ fillers: [] }))
+    ]).then(([modelsList, ttsList, personasList, fillersData]) => {
       setModels(modelsList);
       setSelectedModels(modelsList.map(m => m.id));
       setTtsEngines(ttsList);
       setPersonas(personasList);
+      if (fillersData && fillersData.fillers) {
+        setFillers(fillersData.fillers);
+      }
 
       if (personasList.length > 0) {
         const def = personasList.find(p => p.id === 'vaani_inbound') || personasList[0];
@@ -302,7 +322,7 @@ export default function App() {
       setBargeInOccurred(true);
       setTimeout(() => setBargeInOccurred(false), 2500);
 
-      // 1. Immediately pause and reset playback
+      // 1. Immediately pause and reset playback & voice filler
       if (vaLiveAudioRef.current) {
         vaLiveAudioRef.current.pause();
         vaLiveAudioRef.current.currentTime = 0;
@@ -311,6 +331,11 @@ export default function App() {
         vaGreetAudioRef.current.pause();
         vaGreetAudioRef.current.currentTime = 0;
       }
+      if (vaFillerAudioRef.current) {
+        vaFillerAudioRef.current.pause();
+        vaFillerAudioRef.current.currentTime = 0;
+      }
+      setBackchannelActive(false);
 
       // 2. Abort any in-flight fetch request
       if (abortControllerRef.current) {
@@ -507,6 +532,22 @@ export default function App() {
     updateVaPhase('processing');
     console.log(`[Voice Assistant] Submitting voice turn: ${blob.size} bytes`);
 
+    // ⚡ Instant Backchanneling Voice Filler Playback
+    if (enableBackchanneling && fillers.length > 0) {
+      try {
+        const randomFiller = fillers[Math.floor(Math.random() * fillers.length)];
+        const fillerEl = vaFillerAudioRef.current;
+        if (fillerEl && randomFiller.audio_url) {
+          fillerEl.src = randomFiller.audio_url;
+          fillerEl.currentTime = 0;
+          fillerEl.play().catch(e => console.log("Filler play error:", e));
+          setBackchannelActive(true);
+        }
+      } catch (fe) {
+        console.log("Filler trigger error:", fe);
+      }
+    }
+
     const formData = new FormData();
     formData.append('audio', blob, `turn_${Date.now()}.webm`);
     formData.append('stt_model', sttModel);
@@ -530,15 +571,27 @@ export default function App() {
       }
 
       const data = await response.json();
+
+      // Stop voice filler as soon as the real response arrives
+      if (vaFillerAudioRef.current) {
+        vaFillerAudioRef.current.pause();
+        vaFillerAudioRef.current.currentTime = 0;
+      }
+      setBackchannelActive(false);
+
       vaSessionIdRef.current = data.session_id;
       setVaSessionId(data.session_id);
       if (data.telemetry) setVaTelemetry(data.telemetry);
 
       const newTurn = {
         id: data.id,
+        turn_index: data.turn_index,
         user_transcript: data.user_transcript,
         llm_response: data.llm_response,
         audio_url: data.audio_url,
+        user_recording_url: data.user_recording_url,
+        assistant_recording_url: data.assistant_recording_url,
+        tool_calls: data.tool_calls || [],
         latency: data.latency,
         tts_engine_used: data.tts_engine_used,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -556,6 +609,12 @@ export default function App() {
       }
       startSilenceAndBargeInMonitor();
     } catch (err) {
+      if (vaFillerAudioRef.current) {
+        vaFillerAudioRef.current.pause();
+        vaFillerAudioRef.current.currentTime = 0;
+      }
+      setBackchannelActive(false);
+
       if (err.name === 'AbortError') {
         console.log("Turn request aborted by barge-in.");
       } else {
@@ -578,6 +637,11 @@ export default function App() {
   };
 
   const endCall = async () => {
+    if (vaFillerAudioRef.current) {
+      vaFillerAudioRef.current.pause();
+      vaFillerAudioRef.current.currentTime = 0;
+    }
+    setBackchannelActive(false);
     stopSilenceMonitor();
     if (vaTimerRef.current) clearInterval(vaTimerRef.current);
     const recorder = vaMediaRecorderRef.current;
@@ -589,6 +653,47 @@ export default function App() {
     stopMicTracks();
 
     await finalizeSession();
+  };
+
+  // Tool Simulation Handlers
+  const handleSimOrder = async () => {
+    if (!simOrderInput.trim()) return;
+    const fd = new FormData();
+    fd.append('order_id', simOrderInput.trim());
+    try {
+      const res = await fetch('/api/tools/lookup_order', { method: 'POST', body: fd });
+      const data = await res.json();
+      setSimOrderRes(data);
+    } catch (e) {
+      setSimOrderRes({ error: e.message });
+    }
+  };
+
+  const handleSimFault = async () => {
+    if (!simFaultInput.trim()) return;
+    const fd = new FormData();
+    fd.append('fault_code', simFaultInput.trim());
+    try {
+      const res = await fetch('/api/tools/lookup_cnh_dtc_fault', { method: 'POST', body: fd });
+      const data = await res.json();
+      setSimFaultRes(data);
+    } catch (e) {
+      setSimFaultRes({ error: e.message });
+    }
+  };
+
+  const handleSimTicket = async () => {
+    if (!simTicketInput.trim()) return;
+    const fd = new FormData();
+    fd.append('issue_summary', simTicketInput.trim());
+    fd.append('priority', 'High');
+    try {
+      const res = await fetch('/api/tools/create_support_ticket', { method: 'POST', body: fd });
+      const data = await res.json();
+      setSimTicketRes(data);
+    } catch (e) {
+      setSimTicketRes({ error: e.message });
+    }
   };
 
   const finalizeSession = async () => {
@@ -778,6 +883,9 @@ export default function App() {
                   🟢 Call Active ({vaPhase.toUpperCase()})
                 </span>
               )}
+              {backchannelActive && (
+                <span className="backchannel-badge">⚡ Voice Backchannel Active ("Ji ek second...")</span>
+              )}
               {bargeInOccurred && (
                 <span className="barge-in-badge">⚡ Interrupted by Barge-In</span>
               )}
@@ -795,12 +903,20 @@ export default function App() {
               <div className="section-title">
                 <span>🎭</span> Multi-Domain Persona Studio & Pipeline Configuration
               </div>
-              <button
-                className="btn-toggle-editor"
-                onClick={() => setShowPromptEditor(!showPromptEditor)}
-              >
-                {showPromptEditor ? '▲ Hide Directives' : '✏️ Tune Runtime Directives'}
-              </button>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button
+                  className="btn-toggle-editor"
+                  onClick={() => setShowToolSimulator(!showToolSimulator)}
+                >
+                  {showToolSimulator ? '▲ Hide Tool Simulator' : '🛠️ External CRM & Tool Playground'}
+                </button>
+                <button
+                  className="btn-toggle-editor"
+                  onClick={() => setShowPromptEditor(!showPromptEditor)}
+                >
+                  {showPromptEditor ? '▲ Hide Directives' : '✏️ Tune Runtime Directives'}
+                </button>
+              </div>
             </div>
 
             <div className="assistant-settings-grid">
@@ -855,10 +971,10 @@ export default function App() {
                 </select>
               </div>
 
-              {/* Tunable VAD Silence Threshold Slider */}
+              {/* Tunable VAD Silence Threshold & Backchanneling Switch */}
               <div className="setting-box">
                 <div className="setting-label-row">
-                  <label className="setting-label">VAD Silence Turn Threshold</label>
+                  <label className="setting-label">VAD Silence Threshold</label>
                   <span className="vad-value-badge">{vadThresholdSeconds}s</span>
                 </div>
                 <input
@@ -872,12 +988,97 @@ export default function App() {
                   disabled={vaCallActive}
                 />
                 <div className="vad-hints">
-                  <span>0.6s (Fast/Quiet)</span>
+                  <span>0.6s (Fast)</span>
                   <span>1.2s (Standard)</span>
                   <span>2.5s (Noisy)</span>
                 </div>
+
+                <div style={{ marginTop: '0.6rem', borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '0.5rem' }}>
+                  <label className="filler-toggle-label">
+                    <input
+                      type="checkbox"
+                      checked={enableBackchanneling}
+                      onChange={(e) => setEnableBackchanneling(e.target.checked)}
+                      disabled={vaCallActive}
+                    />
+                    <span>⚡ Instant Voice Backchanneling (Latency Masking)</span>
+                  </label>
+                </div>
               </div>
             </div>
+
+            {/* External Tool Simulator Playground */}
+            {showToolSimulator && (
+              <div className="tool-simulator-panel">
+                <div className="section-header" style={{ marginBottom: '0.5rem' }}>
+                  <div className="section-title" style={{ fontSize: '0.95rem' }}>
+                    <span>🛠️</span> Simulated External Tool Calling & Dynamic CRM Actions
+                  </div>
+                  <span className="section-hint">Test backchannel-enabled live tool execution</span>
+                </div>
+                <div className="tool-sim-grid">
+                  {/* Tool 1: Order Lookup */}
+                  <div className="sim-box">
+                    <div className="sim-box-title">📦 lookup_order(order_id)</div>
+                    <div className="sim-input-row">
+                      <input
+                        type="text"
+                        className="sim-input"
+                        value={simOrderInput}
+                        onChange={(e) => setSimOrderInput(e.target.value)}
+                        placeholder="e.g. ORD-1092 or ORD-4821"
+                      />
+                      <button className="sim-btn" onClick={handleSimOrder}>Lookup</button>
+                    </div>
+                    {simOrderRes && (
+                      <div className="sim-result-box">
+                        {JSON.stringify(simOrderRes.data || simOrderRes, null, 2)}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Tool 2: CNH Telematics Fault Code */}
+                  <div className="sim-box">
+                    <div className="sim-box-title">🚜 lookup_cnh_dtc_fault(fault_code)</div>
+                    <div className="sim-input-row">
+                      <input
+                        type="text"
+                        className="sim-input"
+                        value={simFaultInput}
+                        onChange={(e) => setSimFaultInput(e.target.value)}
+                        placeholder="e.g. 3142, 1124, 4201, 5200"
+                      />
+                      <button className="sim-btn" onClick={handleSimFault}>Diagnose</button>
+                    </div>
+                    {simFaultRes && (
+                      <div className="sim-result-box">
+                        {JSON.stringify(simFaultRes.data || simFaultRes, null, 2)}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Tool 3: Create Support Ticket */}
+                  <div className="sim-box">
+                    <div className="sim-box-title">🎫 create_support_ticket(summary)</div>
+                    <div className="sim-input-row">
+                      <input
+                        type="text"
+                        className="sim-input"
+                        value={simTicketInput}
+                        onChange={(e) => setSimTicketInput(e.target.value)}
+                        placeholder="Issue summary for escalation..."
+                      />
+                      <button className="sim-btn" onClick={handleSimTicket}>Escalate</button>
+                    </div>
+                    {simTicketRes && (
+                      <div className="sim-result-box">
+                        {JSON.stringify(simTicketRes.data || simTicketRes, null, 2)}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Collapsible Directive Editor */}
             {showPromptEditor && (
@@ -918,7 +1119,7 @@ export default function App() {
               </div>
               <span className="section-hint">
                 {vaCallActive
-                  ? '🔄 Hands-Free VAD + Instant Barge-In Enabled'
+                  ? '🔄 Hands-Free VAD + Instant Barge-In + Audio Backchanneling Enabled'
                   : 'Click Start Call to initiate the hands-free voice pipeline'}
               </span>
             </div>
@@ -936,7 +1137,11 @@ export default function App() {
                 {vaPhase === 'idle' && '⚪ Standby (Microphone Idle)'}
                 {vaPhase === 'greeting' && '👋 Assistant Greeting'}
                 {vaPhase === 'listening' && `🎙️ Listening... (VAD commit ${vadThresholdSeconds}s)`}
-                {vaPhase === 'processing' && '⚡ Reasoning & Synthesizing Response...'}
+                {vaPhase === 'processing' && (
+                  backchannelActive
+                    ? '⚡ Masking Latency: Playing Instant Voice Filler & Reasoning...'
+                    : '⚡ Reasoning, Executing Tools & Synthesizing Response...'
+                )}
                 {vaPhase === 'speaking' && '🔊 Assistant Speaking (Speak anytime to barge-in)'}
               </div>
             </div>
@@ -954,7 +1159,7 @@ export default function App() {
                   <span>⏱️ Call Duration:</span> <strong>{formatTime(vaTimer)}</strong>
                 </div>
                 <button className="btn btn-discard" onClick={endCall}>
-                  🔴 End Call
+                  🔴 End Call & Finalize
                 </button>
               </div>
             )}
@@ -962,6 +1167,7 @@ export default function App() {
             {/* Hidden Audio Elements for Playback */}
             <audio ref={vaGreetAudioRef} onEnded={handleGreetAudioEnded} style={{ display: 'none' }} />
             <audio ref={vaLiveAudioRef} onEnded={handleLiveAudioEnded} style={{ display: 'none' }} />
+            <audio ref={vaFillerAudioRef} style={{ display: 'none' }} />
           </div>
 
           {/* Memory Slots & Real-Time Telemetry Dashboard */}
@@ -971,7 +1177,7 @@ export default function App() {
                 <div className="section-title">
                   <span>🧠</span> Active Memory Slots & Real-Time Telemetry
                 </div>
-                <span className="section-hint">Persisted State Across Turns</span>
+                <span className="section-hint">Persisted State Across Turns & Tool Executions</span>
               </div>
 
               {/* Telemetry Metrics Row */}
@@ -1031,9 +1237,9 @@ export default function App() {
             <div className="card chat-card">
               <div className="section-header">
                 <div className="section-title">
-                  <span>💬</span> Conversational Transcript
+                  <span>💬</span> Conversational Transcript & Live Audio Archive
                 </div>
-                <span className="section-hint">Multi-turn history with latency breakdown</span>
+                <span className="section-hint">Multi-turn history with latency breakdown, tool calls, and turn recordings</span>
               </div>
 
               <div className="chat-container" ref={chatRef}>
@@ -1054,7 +1260,7 @@ export default function App() {
                     <div className="chat-msg user">
                       <div className="chat-bubble">
                         <div className="chat-meta">
-                          <span className="chat-name">User</span>
+                          <span className="chat-name">User (Turn #{turn.turn_index || idx + 1})</span>
                           <span className="chat-time">{turn.timestamp}</span>
                         </div>
                         <div className="chat-text devanagari-text">
@@ -1071,6 +1277,12 @@ export default function App() {
                             ⚡ {turn.latency.total_seconds}s total (STT {turn.latency.stt_seconds}s · LLM {turn.latency.llm_seconds}s · TTS {turn.latency.tts_seconds}s [{turn.tts_engine_used || 'edge-tts'}])
                           </div>
                         )}
+                        {turn.user_recording_url && (
+                          <div className="chat-audio" style={{ marginTop: '0.4rem' }}>
+                            <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>🎙️ User Audio Turn:</span>
+                            <audio controls src={turn.user_recording_url} className="mini-audio-player" style={{ width: '100%', marginTop: '2px' }} />
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -1084,9 +1296,95 @@ export default function App() {
                           <span className="chat-time">{turn.timestamp}</span>
                         </div>
                         <div className="chat-text">"{turn.llm_response.text}"</div>
+
+                        {/* Executed External Tools Rendering */}
+                        {turn.tool_calls && turn.tool_calls.length > 0 && (
+                          <div className="tool-calls-container">
+                            {turn.tool_calls.map((tCall, tIdx) => {
+                              const tName = tCall.tool;
+                              const tData = tCall.result?.data || {};
+                              
+                              if (tName === 'lookup_order') {
+                                return (
+                                  <div className="tool-card order-lookup" key={tIdx}>
+                                    <div className="tool-card-header">
+                                      <span>📦 Live Carrier Dispatch Lookup ({tCall.arguments?.order_id})</span>
+                                      <span className="tool-badge-pill">{tData.status || 'Active'}</span>
+                                    </div>
+                                    <div className="tool-grid-details">
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Carrier & Tracking</span>
+                                        <span className="tool-detail-val">{tData.carrier} ({tData.tracking_number})</span>
+                                      </div>
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Estimated Delivery</span>
+                                        <span className="tool-detail-val">{tData.estimated_delivery}</span>
+                                      </div>
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Current Hub</span>
+                                        <span className="tool-detail-val">{tData.current_location}</span>
+                                      </div>
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Product Item</span>
+                                        <span className="tool-detail-val">{tData.product}</span>
+                                      </div>
+                                    </div>
+                                  </div>
+                                );
+                              } else if (tName === 'lookup_cnh_dtc_fault') {
+                                return (
+                                  <div className="tool-card cnh-dtc" key={tIdx}>
+                                    <div className="tool-card-header">
+                                      <span>🚜 CNH Telematics Fault Code #{tData.fault_code} ({tData.spn_fmi})</span>
+                                      <span className="tool-badge-pill" style={{ color: '#f97316' }}>{tData.severity?.split('-')[0] || 'Warning'}</span>
+                                    </div>
+                                    <div className="tool-grid-details">
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Subsystem</span>
+                                        <span className="tool-detail-val">{tData.subsystem}</span>
+                                      </div>
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Component</span>
+                                        <span className="tool-detail-val">{tData.component}</span>
+                                      </div>
+                                    </div>
+                                    <div className="tool-action-text">
+                                      <strong>Field Action:</strong> {tData.recommended_actions}
+                                    </div>
+                                  </div>
+                                );
+                              } else if (tName === 'create_support_ticket') {
+                                return (
+                                  <div className="tool-card support-ticket" key={tIdx}>
+                                    <div className="tool-card-header">
+                                      <span>🎫 Live Support Ticket Escalation</span>
+                                      <span className="tool-badge-pill">{tCall.result?.ticket_id}</span>
+                                    </div>
+                                    <div className="tool-grid-details">
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">Assigned Queue</span>
+                                        <span className="tool-detail-val">{tData.assigned_team}</span>
+                                      </div>
+                                      <div className="tool-detail-item">
+                                        <span className="tool-detail-label">SLA Target</span>
+                                        <span className="tool-detail-val">{tData.sla_target}</span>
+                                      </div>
+                                    </div>
+                                    <div className="tool-action-text">
+                                      🔔 {tData.sms_notification}
+                                    </div>
+                                  </div>
+                                );
+                              }
+                              return null;
+                            })}
+                          </div>
+                        )}
+
                         {turn.audio_url && (
-                          <div className="chat-audio">
-                            <audio controls src={turn.audio_url} />
+                          <div className="chat-audio" style={{ marginTop: '0.5rem' }}>
+                            <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>🔊 Assistant Voice Audio:</span>
+                            <audio controls src={turn.audio_url} className="mini-audio-player" style={{ width: '100%', marginTop: '2px' }} />
                           </div>
                         )}
                       </div>
@@ -1206,58 +1504,99 @@ export default function App() {
                       <th>CSAT</th>
                       <th>Resolution</th>
                       <th>Extracted Slots</th>
+                      <th>Session Audio Archive</th>
                       <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {callLogs.map((log) => (
-                      <tr key={log.record_id || log.session_id}>
-                        <td>
-                          <div className="log-id">{log.record_id || log.session_id}</div>
-                          <div className="log-timestamp">{log.created_timestamp || 'Recent'}</div>
-                        </td>
-                        <td>
-                          <span className="persona-tag">{log.persona_name || log.persona_id || 'Vaani Inbound'}</span>
-                        </td>
-                        <td>
-                          <span className={`sentiment-badge ${log.aggregate_sentiment || 'neutral'}`}>
-                            {log.aggregate_sentiment || 'neutral'}
-                          </span>
-                        </td>
-                        <td>
-                          <span className="csat-stars-small">
-                            {'★'.repeat(log.overall_satisfaction || 3)}
-                          </span>
-                          <span style={{ fontSize: '0.8rem', color: '#94a3b8', marginLeft: '4px' }}>
-                            ({log.overall_satisfaction || 3}/5)
-                          </span>
-                        </td>
-                        <td>
-                          <span className={`status-pill ${log.resolution_status || 'resolved'}`}>
-                            {log.resolution_status || 'resolved'}
-                          </span>
-                        </td>
-                        <td>
-                          <div className="slots-compact">
-                            {log.extracted_slots && Object.keys(log.extracted_slots).length > 0 ? (
-                              Object.entries(log.extracted_slots).filter(([_, v]) => v).map(([k, v]) => (
-                                <span key={k} className="slot-mini-badge">{k}: {v}</span>
-                              ))
-                            ) : (
-                              <span style={{ color: '#64748b' }}>None</span>
-                            )}
-                          </div>
-                        </td>
-                        <td>
-                          <button
-                            className="btn-inspect"
-                            onClick={() => setSelectedReportModal(log)}
-                          >
-                            🔍 View JSON
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {callLogs.map((log) => {
+                      const isExpanded = expandedCallId === (log.record_id || log.session_id);
+                      const recs = log.recordings || [];
+                      return (
+                        <React.Fragment key={log.record_id || log.session_id}>
+                          <tr>
+                            <td>
+                              <div className="log-id">{log.record_id || log.session_id}</div>
+                              <div className="log-timestamp">{log.created_timestamp || 'Recent'}</div>
+                            </td>
+                            <td>
+                              <span className="persona-tag">{log.persona_name || log.persona_id || 'Vaani Inbound'}</span>
+                            </td>
+                            <td>
+                              <span className={`sentiment-badge ${log.aggregate_sentiment || 'neutral'}`}>
+                                {log.aggregate_sentiment || 'neutral'}
+                              </span>
+                            </td>
+                            <td>
+                              <span className="csat-stars-small">
+                                {'★'.repeat(log.overall_satisfaction || 3)}
+                              </span>
+                              <span style={{ fontSize: '0.8rem', color: '#94a3b8', marginLeft: '4px' }}>
+                                ({log.overall_satisfaction || 3}/5)
+                              </span>
+                            </td>
+                            <td>
+                              <span className={`status-pill ${log.resolution_status || 'resolved'}`}>
+                                {log.resolution_status || 'resolved'}
+                              </span>
+                            </td>
+                            <td>
+                              <div className="slots-compact">
+                                {log.extracted_slots && Object.keys(log.extracted_slots).length > 0 ? (
+                                  Object.entries(log.extracted_slots).filter(([_, v]) => v).map(([k, v]) => (
+                                    <span key={k} className="slot-mini-badge">{k}: {v}</span>
+                                  ))
+                                ) : (
+                                  <span style={{ color: '#64748b' }}>None</span>
+                                )}
+                              </div>
+                            </td>
+                            <td>
+                              <button
+                                className="btn-play-audio"
+                                onClick={() => setExpandedCallId(isExpanded ? null : (log.record_id || log.session_id))}
+                              >
+                                {isExpanded ? '▲ Hide Audio' : `▶️ Listen (${recs.length} clips)`}
+                              </button>
+                            </td>
+                            <td>
+                              <button
+                                className="btn-inspect"
+                                onClick={() => setSelectedReportModal(log)}
+                              >
+                                🔍 View JSON
+                              </button>
+                            </td>
+                          </tr>
+
+                          {/* Expandable Audio Playback Row */}
+                          {isExpanded && (
+                            <tr>
+                              <td colSpan="8" style={{ padding: 0 }}>
+                                <div className="recordings-list-drawer">
+                                  <div className="drawer-title">
+                                    🎙️ Session Audio Recording Archive ({log.session_id || log.record_id}) - {recs.length} Turns Recorded
+                                  </div>
+                                  {recs.length === 0 ? (
+                                    <div style={{ color: '#64748b', fontSize: '0.8rem' }}>No audio files archived for this session yet.</div>
+                                  ) : (
+                                    recs.map((r, rIdx) => (
+                                      <div className="drawer-turn-row" key={rIdx}>
+                                        <span className={`drawer-turn-role ${r.type}`}>
+                                          {r.type === 'user' ? '👤 User Turn' : '🤖 Assistant'}
+                                        </span>
+                                        <span className="drawer-turn-text">{r.filename}</span>
+                                        <audio controls src={r.url} className="mini-audio-player" />
+                                      </div>
+                                    ))
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1273,6 +1612,22 @@ export default function App() {
                   <button className="modal-close-btn" onClick={() => setSelectedReportModal(null)}>✕</button>
                 </div>
                 <div className="modal-body">
+                  {selectedReportModal.recordings && selectedReportModal.recordings.length > 0 && (
+                    <div style={{ marginBottom: '1.25rem', padding: '0.75rem', background: 'rgba(15,23,42,0.8)', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                      <h4 style={{ fontSize: '0.85rem', color: '#93c5fd', marginBottom: '0.5rem' }}>🎙️ Turn Audio Recordings for this Call:</h4>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                        {selectedReportModal.recordings.map((rec, rIdx) => (
+                          <div key={rIdx} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', fontSize: '0.8rem' }}>
+                            <span style={{ color: rec.type === 'user' ? '#60a5fa' : '#c084fc', fontWeight: 600 }}>
+                              {rec.type === 'user' ? 'User Speech' : 'Assistant Audio'} ({rec.filename})
+                            </span>
+                            <audio controls src={rec.url} className="mini-audio-player" />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   <pre className="json-viewer">
                     {JSON.stringify(selectedReportModal, null, 2)}
                   </pre>

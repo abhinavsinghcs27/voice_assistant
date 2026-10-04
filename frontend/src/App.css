@@ -1321,3 +1321,287 @@ body {
   text-align: center;
   color: var(--text-muted);
 }
+
+/* ==========================================================================
+   Instant Conversational Voice Fillers & Backchanneling
+   ========================================================================== */
+.backchannel-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.65rem;
+  background: rgba(234, 179, 8, 0.15);
+  border: 1px solid rgba(234, 179, 8, 0.4);
+  color: #fde047;
+  border-radius: 9999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  animation: pulseYellow 1.5s infinite;
+}
+
+@keyframes pulseYellow {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.75; transform: scale(0.98); }
+}
+
+.filler-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #e2e8f0;
+}
+
+.filler-toggle-label input {
+  accent-color: #3b82f6;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+/* ==========================================================================
+   External Simulated Tool Calling Badges & Cards
+   ========================================================================== */
+.tool-calls-container {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.tool-card {
+  border-radius: var(--radius-md);
+  padding: 0.85rem 1rem;
+  font-size: 0.86rem;
+  border-left: 4px solid;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2);
+}
+
+.tool-card.order-lookup {
+  background: rgba(14, 116, 144, 0.2);
+  border-color: #06b6d4;
+  border-top: 1px solid rgba(6, 182, 212, 0.3);
+  border-right: 1px solid rgba(6, 182, 212, 0.3);
+  border-bottom: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.tool-card.cnh-dtc {
+  background: rgba(194, 65, 12, 0.2);
+  border-color: #f97316;
+  border-top: 1px solid rgba(249, 115, 22, 0.3);
+  border-right: 1px solid rgba(249, 115, 22, 0.3);
+  border-bottom: 1px solid rgba(249, 115, 22, 0.3);
+}
+
+.tool-card.support-ticket {
+  background: rgba(126, 34, 206, 0.2);
+  border-color: #a855f7;
+  border-top: 1px solid rgba(168, 85, 247, 0.3);
+  border-right: 1px solid rgba(168, 85, 247, 0.3);
+  border-bottom: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.tool-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.4rem;
+  font-weight: 700;
+  font-size: 0.84rem;
+}
+
+.tool-card.order-lookup .tool-card-header { color: #67e8f9; }
+.tool-card.cnh-dtc .tool-card-header { color: #fdba74; }
+.tool-card.support-ticket .tool-card-header { color: #d8b4fe; }
+
+.tool-badge-pill {
+  padding: 0.15rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.tool-grid-details {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.tool-detail-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.tool-detail-label {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.tool-detail-val {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.tool-action-text {
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  color: #cbd5e1;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+}
+
+/* ==========================================================================
+   Audio Playback in Table & Logs Dashboard
+   ========================================================================== */
+.table-audio-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.btn-play-audio {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: rgba(59, 130, 246, 0.15);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  color: #93c5fd;
+  padding: 0.3rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.btn-play-audio:hover {
+  background: rgba(59, 130, 246, 0.3);
+  color: #ffffff;
+}
+
+.recordings-list-drawer {
+  background: rgba(15, 23, 42, 0.6);
+  border-top: 1px solid var(--border-subtle);
+  padding: 0.75rem 1rem;
+}
+
+.drawer-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #94a3b8;
+  margin-bottom: 0.5rem;
+}
+
+.drawer-turn-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  font-size: 0.82rem;
+}
+
+.drawer-turn-row:last-child {
+  border-bottom: none;
+}
+
+.drawer-turn-role {
+  font-weight: 600;
+  min-width: 80px;
+}
+
+.drawer-turn-role.user { color: #60a5fa; }
+.drawer-turn-role.assistant { color: #c084fc; }
+
+.drawer-turn-text {
+  flex: 1;
+  color: #cbd5e1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mini-audio-player {
+  height: 28px;
+  max-width: 220px;
+}
+
+/* Tool Testing Simulator Drawer / Accordion */
+.tool-simulator-panel {
+  margin-top: 1rem;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+}
+
+.tool-sim-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.sim-box {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+}
+
+.sim-box-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #e2e8f0;
+  margin-bottom: 0.5rem;
+}
+
+.sim-input-row {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.sim-input {
+  flex: 1;
+  background: rgba(15, 23, 42, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #f8fafc;
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+}
+
+.sim-btn {
+  background: #2563eb;
+  color: white;
+  border: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.sim-btn:hover {
+  background: #1d4ed8;
+}
+
+.sim-result-box {
+  margin-top: 0.5rem;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.5rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.76rem;
+  max-height: 120px;
+  overflow-y: auto;
+  color: #94a3b8;
+  white-space: pre-wrap;
+}

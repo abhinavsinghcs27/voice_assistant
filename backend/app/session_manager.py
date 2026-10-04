@@ -49,13 +49,16 @@ class SessionManager:
         
         return self.sessions[session_id]
 
-    def add_turn(self, session_id: str, role: str, content: str):
+    def add_turn(self, session_id: str, role: str, content: str, metadata: Optional[dict] = None):
         session = self.get_or_create_session(session_id)
-        session["history"].append({
+        turn_entry = {
             "role": role,
             "content": content,
             "timestamp": time.time()
-        })
+        }
+        if metadata and isinstance(metadata, dict):
+            turn_entry.update(metadata)
+        session["history"].append(turn_entry)
         session["last_active"] = time.time()
 
     def record_interruption(self, session_id: str):
