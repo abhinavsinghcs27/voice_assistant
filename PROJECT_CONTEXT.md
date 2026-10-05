@@ -4,13 +4,20 @@
 
 This project is a high-performance **Hindi and Hinglish Speech-to-Text (STT) Benchmarking and Conversational Voice Assistant System**, built to operate efficiently on an **office laptop (CPU-bound)** with **zero cloud costs ($0)**.
 
-The system serves two core operational modes:
-1. **STT Benchmark Suite**: Multi-model evaluation comparing transcript quality, Devanagari Hindi text, Romanised Hinglish, English translation, processing time, and Real-Time Factor (RTF) across:
+The system serves three core operational modules:
+1. **STT Benchmark Suite**: Multi-model evaluation comparing transcript quality, Devanagari Hindi text, Romanised Hinglish, English translation, processing time, WER/CER, and Real-Time Factor (RTF) across:
    - `AI4Bharat IndicConformer (Sherpa-ONNX INT8)` (~200ms CPU inference)
-   - `Faster Whisper Large-V3`
-   - `Faster Whisper Medium`
-2. **Sub-Second Voice Assistant Engine**: Low-latency voice-to-voice interaction loop:
-   `Audio Input -> Fast STT -> Groq Cloud LLaMA 3.3 70B LLM -> gTTS Audio Output`
+   - `Faster Whisper Large-V3` / `Faster Whisper Medium`
+   - `Groq Cloud Whisper (whisper-large-v3)` (<400ms ultra-fast cloud inference)
+2. **Sub-Second Voice Assistant Engine**:
+   - Multi-persona studio (Vaani Customer Support, CNH Telematics Specialist, Krishi Mitra Agri Advisor).
+   - Zero-latency client barge-in interruption detection.
+   - Ultra-fast conversational fillers & audio backchanneling (pre-baked at startup) to eliminate perceptual latency.
+   - Simulated external tool calling & dynamic CRM actions (`lookup_order`, `lookup_cnh_dtc_fault`, `create_support_ticket`).
+   - Multi-engine TTS (Edge-TTS Neural, gTTS, pyttsx3) with automatic Hinglish transliteration.
+3. **Session Audio Recording Archival & Post-Call Analytics**:
+   - Turn-by-turn user and assistant audio recording archival in `backend/session-recordings/`.
+   - Comprehensive post-call reporting (CSAT, sentiment scoring, intent resolution, escalation flags, slot tracking) with direct in-browser recording playback.
 
 ---
 
@@ -19,16 +26,18 @@ The system serves two core operational modes:
 ```text
 hindi-stt-benchmark/
 ├── PROJECT_CONTEXT.md
-├── implementation_plan.md
 ├── backend/
 │   ├── .env
 │   ├── .env.example
 │   ├── requirements.txt
+│   ├── test_pipeline_features.py
 │   ├── app/
 │   │   ├── __init__.py
 │   │   ├── config.py
 │   │   ├── formatter.py
 │   │   ├── main.py
+│   │   ├── session_manager.py
+│   │   ├── tools.py
 │   │   ├── llm/
 │   │   │   ├── __init__.py
 │   │   │   └── groq_provider.py
@@ -36,13 +45,16 @@ hindi-stt-benchmark/
 │   │   │   ├── __init__.py
 │   │   │   ├── base.py
 │   │   │   ├── faster_whisper_provider.py
+│   │   │   ├── groq_whisper_provider.py
 │   │   │   └── indic_conformer_provider.py
 │   │   └── tts/
 │   │       ├── __init__.py
 │   │       └── tts_provider.py
 │   ├── models/            # Local ONNX storage for offline execution
-│   ├── recordings/        # Runtime temporary audio storage (auto-created)
-│   └── results/           # Runtime benchmark result persistence (auto-created)
+│   ├── post-call-analysis/# Persisted structured post-call JSON & JSONL records
+│   ├── session-recordings/# Turn-by-turn audio storage (.webm & .mp3)
+│   ├── recordings/        # Runtime temporary benchmark audio storage
+│   └── results/           # Runtime benchmark comparative JSON persistence
 └── frontend/
     ├── package.json
     ├── vite.config.js
@@ -69,7 +81,9 @@ sherpa-onnx==1.13.6
 soundfile==0.14.0
 indic-transliteration==2.3.82
 deep-translator==1.11.4
+edge-tts>=6.1.9
 gTTS==2.5.1
+pyttsx3>=2.90
 groq==0.4.2
 httpx==0.27.0
 python-dotenv==1.0.1
@@ -78,26 +92,23 @@ python-dotenv==1.0.1
 ### Environment Variables (`backend/.env`)
 ```ini
 GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=openai/gpt-oss-20b
+GROQ_MODEL=llama-3.3-70b-versatile
 ```
 
 ---
 
-## 4. Replication Steps for Antigravity on Device 2
+## 4. Running the Development Servers
 
-1. **Clone/Create Repository Root**:
-   `mkdir hindi-stt-benchmark && cd hindi-stt-benchmark`
-
-2. **Backend Setup**:
+1. **Backend Server** (Port 8000):
    ```powershell
    cd backend
-   python -m venv venv
-   .\venv\Scripts\Activate.ps1
-   pip install -r requirements.txt
+   .\venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
    ```
-   Add your `GROQ_API_KEY` to `backend/.env`.
 
-3. **Start Servers**:
-   - Backend: `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`
-   - Frontend: `npm install && npm run dev`
+2. **Frontend Server** (Port 3000):
+   ```powershell
+   cd frontend
+   npm run dev
+   ```
+
 
