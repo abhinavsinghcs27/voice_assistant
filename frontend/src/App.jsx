@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './App.css';
 
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('assistant'); // 'assistant' | 'analytics' | 'benchmark'
 
@@ -113,10 +115,10 @@ export default function App() {
   // Initial Data Fetch
   useEffect(() => {
     Promise.all([
-      fetch('/api/models').then(r => r.json()).catch(() => []),
-      fetch('/api/tts/engines').then(r => r.json()).catch(() => []),
-      fetch('/api/personas').then(r => r.json()).catch(() => []),
-      fetch('/api/voice-assistant/fillers').then(r => r.json()).catch(() => ({ fillers: [] }))
+      fetch(`${API_BASE}/api/models`).then(r => r.json()).catch(() => []),
+      fetch(`${API_BASE}/api/tts/engines`).then(r => r.json()).catch(() => []),
+      fetch(`${API_BASE}/api/personas`).then(r => r.json()).catch(() => []),
+      fetch(`${API_BASE}/api/voice-assistant/fillers`).then(r => r.json()).catch(() => ({ fillers: [] }))
     ]).then(([modelsList, ttsList, personasList, fillersData]) => {
       setModels(modelsList);
       setSelectedModels(modelsList.map(m => m.id));
@@ -141,7 +143,7 @@ export default function App() {
   }, []);
 
   const fetchAnalytics = () => {
-    fetch('/api/voice-assistant/reports')
+    fetch(`${API_BASE}/api/voice-assistant/reports`)
       .then(r => r.json())
       .then(data => {
         if (data.analytics) setAnalyticsData(data.analytics);
@@ -347,7 +349,7 @@ export default function App() {
       if (vaSessionIdRef.current) {
         const fd = new FormData();
         fd.append('session_id', vaSessionIdRef.current);
-        fetch('/api/voice-assistant/barge-in', { method: 'POST', body: fd }).catch(e => console.log("Barge-in sync:", e));
+        fetch(`${API_BASE}/api/voice-assistant/barge-in`, { method: 'POST', body: fd }).catch(e => console.log("Barge-in sync:", e));
       }
 
       // 4. Immediately switch back to listening
@@ -453,7 +455,7 @@ export default function App() {
       formData.append('tts_engine', ttsEngine);
       if (customGreeting.trim()) formData.append('custom_greeting', customGreeting.trim());
 
-      const res = await fetch('/api/voice-assistant/greet', { method: 'POST', body: formData });
+      const res = await fetch(`${API_BASE}/api/voice-assistant/greet`, { method: 'POST', body: formData });
       if (!res.ok) {
         const ed = await res.json();
         throw new Error(ed.detail || 'Greeting failed.');
@@ -559,7 +561,7 @@ export default function App() {
     abortControllerRef.current = new AbortController();
 
     try {
-      const response = await fetch('/api/voice-assistant/interact', {
+      const response = await fetch(`${API_BASE}/api/voice-assistant/interact`, {
         method: 'POST',
         body: formData,
         signal: abortControllerRef.current.signal
@@ -701,7 +703,7 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append('session_id', vaSessionIdRef.current);
-      const res = await fetch('/api/voice-assistant/finalize', {
+      const res = await fetch(`${API_BASE}/api/voice-assistant/finalize`, {
         method: 'POST',
         body: formData,
       });
@@ -806,7 +808,7 @@ export default function App() {
     if (bmReferenceText.trim()) formData.append('reference_text', bmReferenceText.trim());
 
     try {
-      const response = await fetch('/api/benchmark', {
+      const response = await fetch(`${API_BASE}/api/benchmark`, {
         method: 'POST',
         body: formData,
       });
