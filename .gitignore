@@ -13,9 +13,11 @@ __pycache__/
 *$py.class
 *.pyc
 
-# Node modules
+# Node modules & standalone runtime
 node_modules/
 frontend/node_modules/
+.node/
+frontend/.node/
 
 # Build artifacts
 frontend/dist/
