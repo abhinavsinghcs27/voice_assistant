@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("main_api")
@@ -806,3 +807,22 @@ async def get_report_by_id(record_id: str):
                     for f in sorted(sdir.iterdir(), key=lambda p: p.stat().st_mtime) if f.is_file()
                 ]
         return data
+
+
+# =====================================================================
+# Unified Deployment Mode: Serve React Frontend SPA if built
+# =====================================================================
+FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    assets_dir = FRONTEND_DIST / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend_spa(full_path: str):
+        if full_path.startswith("api"):
+            raise HTTPException(status_code=404, detail="API route not found.")
+        target_file = FRONTEND_DIST / full_path
+        if target_file.exists() and target_file.is_file():
+            return FileResponse(target_file)
+        return FileResponse(FRONTEND_DIST / "index.html")
